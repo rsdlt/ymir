@@ -1,3 +1,4 @@
+mod filter;
 mod index;
 mod record;
 mod store;
