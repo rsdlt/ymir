@@ -1,0 +1,44 @@
+[package]
+name = "ymir-code"
+version = "0.1.0"
+edition = "2024"
+description = "Browse and search your Claude Code sessions: prompts, replies, tool calls and edits, with fzf-style search"
+license = "MIT"
+rust-version = "1.88"
+readme = "README.md"
+# What the crate ships: the code, its tests and the docs crates.io shows. A list
+# of what goes in, so a stray file in the working tree never ends up published.
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/fixtures/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+repository = "https://github.com/rsdlt/ymir"
+keywords = ["claude", "tui", "fuzzy", "terminal", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+# The crate is ymir-code (ymir was taken on crates.io); the command is ymir.
+[[bin]]
+name = "ymir"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+nucleo-matcher = "0.3.1"
+ratatui = "0.30.2"
+serde = { version = "1.0", features = ["derive"] }
+# raw_value: parts of a record are borrowed unparsed and only read when needed.
+serde_json = { version = "1.0", features = ["raw_value"] }
+# Already in the tree through ratatui; named here to wrap transcript text.
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
