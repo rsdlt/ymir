@@ -18,14 +18,16 @@ const ACCENT: Color = Color::Cyan;
 
 /// The bottom row's key hints, most useful first. Those that don't fit the
 /// terminal's width are dropped from the end.
-const HINTS: [(&str, &str); 8] = [
+const HINTS: [(&str, &str); 10] = [
     ("↑↓", "move"),
     ("enter", "pick"),
     ("tab", "pane"),
     ("esc", "clear/quit"),
     ("C-y", "copy id"),
+    ("C-e", "all output"),
     ("pgup/pgdn", "scroll"),
     ("S-↑↓", "turn"),
+    ("S-←→", "sideways"),
     ("C-w", "delete word"),
 ];
 
@@ -290,6 +292,9 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         Some(s) => format!(" {} ", app::short(&s.file.id)),
         None => " transcript ".into(),
     };
+    if app.expanded {
+        title.push_str("· all output ");
+    }
     if app.column > 0 {
         // Says the diffs are shifted, and by how much.
         title.push_str(&format!("· col {} ", app.column + 1));

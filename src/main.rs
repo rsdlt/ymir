@@ -286,8 +286,8 @@ fn run(terminal: &mut Tui, app: &mut App, files: Vec<SessionFile>) -> Result<()>
     let transcripts = worker::spawn_transcripts(tx);
     loop {
         app.settle();
-        if let Some(file) = app.take_request() {
-            transcripts.send(file)?;
+        if let Some(request) = app.take_request() {
+            transcripts.send(request)?;
         }
         if let Some(text) = app.take_clipboard() {
             clipboard::copy(&text);

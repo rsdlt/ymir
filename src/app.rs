@@ -18,7 +18,7 @@ use crate::layout::{Resize, Seam, Splits};
 use crate::store::SessionFile;
 use crate::text;
 use crate::time;
-use crate::transcript::{Look, Transcript};
+use crate::transcript::{Limits, Look, Transcript};
 
 /// Transcripts kept after they're read.
 const TRANSCRIPT_CACHE: usize = 8;
@@ -104,9 +104,11 @@ pub struct App {
     pub offsets: [usize; 2],
     transcripts: VecDeque<Arc<Transcript>>,
     /// A transcript to read, for `main` to hand to the worker.
-    request: Option<SessionFile>,
+    request: Option<(SessionFile, Limits)>,
     /// The transcript last asked for, so it isn't asked for twice.
-    asked: Option<String>,
+    asked: Option<(String, Limits)>,
+    /// Tool output shown in full (`C-e`), in every session.
+    pub expanded: bool,
     failed: Option<(String, String)>,
     wrapped: Option<Wrapped>,
     /// First transcript row on screen.
@@ -146,6 +148,7 @@ impl App {
             transcripts: VecDeque::new(),
             request: None,
             asked: None,
+            expanded: false,
             failed: None,
             wrapped: None,
             scroll: 0,
@@ -185,7 +188,8 @@ impl App {
             Msg::IndexDone => self.indexing = false,
             Msg::Transcript(id, result) => match result {
                 Ok(t) => {
-                    self.transcripts.retain(|old| old.id != id);
+                    self.transcripts
+                        .retain(|old| old.id != id || old.limits != t.limits);
                     self.transcripts.push_front(t);
                     self.transcripts.truncate(TRANSCRIPT_CACHE);
                 }
@@ -271,22 +275,34 @@ impl App {
         self.ask_transcript();
     }
 
+    fn limits(&self) -> Limits {
+        if self.expanded {
+            Limits::FULL
+        } else {
+            Limits::SCREEN
+        }
+    }
+
     fn ask_transcript(&mut self) {
         let Some(file) = self.session().map(|s| s.file.clone()) else {
             return;
         };
-        if self.asked.as_deref() != Some(&file.id) && self.cached(&file.id).is_none() {
-            self.asked = Some(file.id.clone());
-            self.request = Some(file);
+        let want = (file.id.clone(), self.limits());
+        if self.asked.as_ref() != Some(&want) && self.cached(&file.id).is_none() {
+            self.asked = Some(want);
+            self.request = Some((file, self.limits()));
         }
     }
 
     fn cached(&self, id: &str) -> Option<&Arc<Transcript>> {
-        self.transcripts.iter().find(|t| t.id == id)
+        let limits = self.limits();
+        self.transcripts
+            .iter()
+            .find(|t| t.id == id && t.limits == limits)
     }
 
     /// A transcript for `main` to have read.
-    pub fn take_request(&mut self) -> Option<SessionFile> {
+    pub fn take_request(&mut self) -> Option<(SessionFile, Limits)> {
         self.request.take()
     }
 
@@ -316,23 +332,23 @@ impl App {
         let stale = self
             .wrapped
             .as_ref()
-            .is_none_or(|w| w.t.id != t.id || w.width != width);
+            .is_none_or(|w| !Arc::ptr_eq(&w.t, &t) || w.width != width);
         if stale {
-            let same = self.wrapped.as_ref().is_some_and(|w| w.t.id == t.id);
+            let session = self.wrapped.as_ref().is_some_and(|w| w.t.id == t.id);
             // Keep the line on top when only the width changed.
             let top = self
                 .wrapped
                 .as_ref()
-                .filter(|_| same)
+                .filter(|w| Arc::ptr_eq(&w.t, &t))
                 .and_then(|w| w.rows.get(self.scroll))
                 .map(|r| r.item);
             self.wrapped = Some(wrap(&t, width));
-            if !same {
+            if !session {
                 self.column = 0;
             }
             if let Some(item) = top {
                 self.scroll = self.wrapped.as_ref().unwrap().starts[item];
-            } else if !same && self.follow.is_none() {
+            } else if !session && self.follow.is_none() {
                 self.scroll = 0;
             }
         }
@@ -398,6 +414,7 @@ impl App {
             KeyCode::PageUp => self.scroll_by(-page),
             KeyCode::Tab | KeyCode::Right => self.focus = self.focus.next(),
             KeyCode::BackTab | KeyCode::Left => self.focus = self.focus.prev(),
+            KeyCode::Char('e') if ctrl => self.expand(),
             KeyCode::Char('y') if ctrl => {
                 if let Some(id) = self.session().map(|s| s.file.id.clone()) {
                     self.notice = Some(format!("copied {}", short(&id)));
@@ -448,6 +465,27 @@ impl App {
     fn scroll_by(&mut self, delta: isize) {
         let rows = self.wrapped.as_ref().map_or(0, |w| w.rows.len());
         self.scroll = step(self.scroll, delta, rows);
+    }
+
+    /// Shows tool output in full, or cut again, keeping the entry on top
+    /// in view.
+    fn expand(&mut self) {
+        self.expanded = !self.expanded;
+        self.notice = Some(
+            if self.expanded {
+                "all output"
+            } else {
+                "output cut"
+            }
+            .into(),
+        );
+        if let Some(w) = &self.wrapped
+            && let Some(row) = w.rows.get(self.scroll)
+        {
+            // The entry the top line belongs to: both versions have it.
+            self.follow = w.t.items[..=row.item].iter().rev().find_map(|i| i.entry);
+        }
+        self.ask_transcript();
     }
 
     /// Moves diffs sideways, no further than it takes to show the end of the
@@ -620,7 +658,7 @@ pub mod tests {
     use crate::index;
     use crate::store;
     use crate::testutil::{self, Claude};
-    use crate::transcript::{self, Limits};
+    use crate::transcript;
     use serde_json::json;
 
     /// An app with three sessions read, and transcripts served on request.
@@ -637,8 +675,8 @@ pub mod tests {
     }
 
     pub fn serve(app: &mut App) {
-        while let Some(file) = app.take_request() {
-            let t = transcript::load(&file, Limits::SCREEN).map_err(|e| e.to_string());
+        while let Some((file, limits)) = app.take_request() {
+            let t = transcript::load(&file, limits).map_err(|e| e.to_string());
             app.update(Msg::Transcript(file.id.clone(), t.map(Arc::new)));
         }
     }
@@ -877,5 +915,43 @@ pub mod tests {
         key(&mut app, KeyCode::Down);
         app.wrap_transcript(20);
         assert_eq!(app.column, 0);
+    }
+
+    #[test]
+    fn all_output_and_back_keeps_the_place() {
+        let claude = Claude::new();
+        let long: Vec<String> = (0..30).map(|n| format!("line {n}")).collect();
+        let mut lines = Vec::new();
+        for (n, at) in ["10:00", "10:01", "10:02"].iter().enumerate() {
+            let id = format!("t{n}");
+            lines.push(claude.prompt(
+                &format!("Count to 30, take {n}"),
+                &format!("2026-01-01T{at}:00Z"),
+            ));
+            lines.push(claude.tool(&id, "Bash", json!({"command": "seq 30"})));
+            lines.push(testutil::result(&id, &long.join("\n"), json!({})));
+        }
+        claude.session("-w", "55555555-eeee", &lines);
+        let mut app = loaded(&claude);
+        app.focus = Focus::Turns;
+        key(&mut app, KeyCode::Down);
+        app.wrap_transcript(60);
+        let top = |app: &App| app.row_text(&app.wrapped_rows()[app.scroll + 1]);
+        assert_eq!(top(&app), "  Count to 30, take 1");
+        let cut = app.wrapped_rows().len();
+
+        ctrl(&mut app, 'e');
+        assert_eq!(app.notice.as_deref(), Some("all output"));
+        serve(&mut app);
+        app.wrap_transcript(60);
+        assert_eq!(app.wrapped_rows().len(), cut + 3 * 24 - 3);
+        assert_eq!(top(&app), "  Count to 30, take 1");
+
+        // And back.
+        ctrl(&mut app, 'e');
+        serve(&mut app);
+        app.wrap_transcript(60);
+        assert_eq!(app.wrapped_rows().len(), cut);
+        assert_eq!(top(&app), "  Count to 30, take 1");
     }
 }

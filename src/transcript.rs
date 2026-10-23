@@ -70,25 +70,37 @@ pub struct Transcript {
     /// Where each entry starts, by entry number.
     pub entries: Vec<usize>,
     pub turns: usize,
+    /// What it was read with.
+    pub limits: Limits,
 }
 
 /// How much of each output to show.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Lines of a tool's output.
     pub output: usize,
     /// Lines of one file's diff.
     pub diff: usize,
+    /// Whether a file a call created is shown whole, or by its size.
+    pub created: bool,
 }
 
 impl Limits {
     pub const SCREEN: Limits = Limits {
         output: 6,
         diff: 400,
+        created: false,
+    };
+    /// The screen with `C-e`: everything.
+    pub const FULL: Limits = Limits {
+        output: usize::MAX,
+        diff: usize::MAX,
+        created: true,
     };
     pub const PLAIN: Limits = Limits {
         output: 20,
         diff: 2000,
+        created: false,
     };
 }
 
@@ -294,8 +306,15 @@ impl Builder {
             None => format!("{path} · +{added} -{removed}"),
         };
         self.push(Look::File, &head, indent, None);
-        if edit.created.is_some() {
+        if edit.created.is_some() && !self.limits.created {
             // A new file's content is the whole file; its size says enough.
+            return;
+        }
+        if let Some(content) = &edit.content {
+            // As a diff would show it: every line added.
+            for line in content.lines() {
+                self.push(Look::Added, &format!("+{line}"), indent, None);
+            }
             return;
         }
         let start = self.parts.last().map_or(0, Vec::len);
@@ -368,6 +387,7 @@ pub fn load(file: &SessionFile, limits: Limits) -> io::Result<Transcript> {
         items,
         entries,
         turns: b.turn,
+        limits,
     })
 }
 
@@ -548,6 +568,31 @@ mod tests {
                 (Look::Error, "Exit code 1"),
             ]
         );
+        // With everything shown, the new file is all there.
+        let t = load(&file, Limits::FULL).unwrap();
+        let file: Vec<_> = t.items[4..8].iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(file, ["new.rs · created, 3 lines", "+a", "+b", "+c"]);
+        assert_eq!(t.items[5].look, Look::Added);
+    }
+
+    #[test]
+    fn full_limits_show_all_output() {
+        let claude = Claude::new();
+        let long: Vec<String> = (0..100).map(|n| format!("line {n}")).collect();
+        let file = claude.session(
+            "-w",
+            "aaaa0005",
+            &[
+                claude.tool("t1", "Bash", json!({"command": "seq"})),
+                testutil::result("t1", &long.join("\n"), json!({})),
+            ],
+        );
+        let output = |limits| {
+            let t = load(&file, limits).unwrap();
+            t.items.iter().filter(|i| i.look == Look::Output).count()
+        };
+        assert_eq!(output(Limits::SCREEN), 6);
+        assert_eq!(output(Limits::FULL), 100);
     }
 
     #[test]
@@ -564,8 +609,8 @@ mod tests {
             ],
         );
         let limits = Limits {
-            output: 6,
             diff: 10,
+            ..Limits::SCREEN
         };
         let t = load(&file, limits).unwrap();
         let last = t.items.last().unwrap();
@@ -627,5 +672,19 @@ mod real {
             slowest.0
         );
         println!("{diff} diff lines, {marked} with changed words; widest {widest} columns");
+        // With C-e: everything, for the largest and the slowest sessions.
+        let slow = times.iter().position(|t| t == slowest).unwrap();
+        for file in [&files[files.len() - 1], &files[slow]] {
+            let start = Instant::now();
+            let t = load(file, Limits::FULL).unwrap();
+            let bytes: usize = t.items.iter().map(|i| i.text.len()).sum();
+            println!(
+                "all output, {:.1} MB session: {:?}, {} lines, {:.1} MB of text",
+                file.size as f64 / 1e6,
+                start.elapsed(),
+                t.items.len(),
+                bytes as f64 / 1e6
+            );
+        }
     }
 }

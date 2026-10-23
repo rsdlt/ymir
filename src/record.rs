@@ -181,6 +181,8 @@ pub struct Edit {
     pub hunks: Vec<Hunk>,
     /// For a file the call created: how many lines it has.
     pub created: Option<usize>,
+    /// A file Write created, whole: it has no hunks.
+    pub content: Option<String>,
 }
 
 /// A unified-diff hunk: `lines` start with `+`, `-` or a space.
@@ -531,13 +533,15 @@ fn edits(raw: &RawValue) -> Vec<Edit> {
     let mut out = Vec::new();
     if let Some(path) = s.file_path {
         let hunks = s.patch.unwrap_or_default();
-        let created = (s.kind.as_deref() == Some("create"))
-            .then(|| s.content.as_deref().map_or(0, |c| c.lines().count()));
+        let create = s.kind.as_deref() == Some("create");
+        let content = s.content.filter(|_| create);
+        let created = create.then(|| content.as_deref().map_or(0, |c| c.lines().count()));
         if !hunks.is_empty() || created.is_some() {
             out.push(Edit {
                 path,
                 hunks,
                 created,
+                content,
             });
         }
     }
@@ -547,6 +551,7 @@ fn edits(raw: &RawValue) -> Vec<Edit> {
             path: file.file_path,
             created: file.created.then_some(added),
             hunks: file.hunks,
+            content: None,
         });
     }
     out

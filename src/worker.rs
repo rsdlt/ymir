@@ -62,14 +62,15 @@ pub fn spawn_index(files: Vec<SessionFile>, tx: Sender<Msg>) {
 
 /// Reads transcripts one at a time. Only the latest request matters: when
 /// the selection runs ahead, older ones are dropped unread.
-pub fn spawn_transcripts(tx: Sender<Msg>) -> Sender<SessionFile> {
-    let (req_tx, req_rx) = mpsc::channel::<SessionFile>();
+pub fn spawn_transcripts(tx: Sender<Msg>) -> Sender<(SessionFile, Limits)> {
+    let (req_tx, req_rx) = mpsc::channel::<(SessionFile, Limits)>();
     thread::spawn(move || {
-        while let Ok(mut file) = req_rx.recv() {
+        while let Ok(mut req) = req_rx.recv() {
             while let Ok(newer) = req_rx.try_recv() {
-                file = newer;
+                req = newer;
             }
-            let result = transcript::load(&file, Limits::SCREEN)
+            let (file, limits) = req;
+            let result = transcript::load(&file, limits)
                 .map(Arc::new)
                 .map_err(|e| e.to_string());
             if tx.send(Msg::Transcript(file.id, result)).is_err() {
