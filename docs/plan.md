@@ -139,7 +139,21 @@ anything else, the tool name and its first string input.
 **Sidechains.** `isSidechain: true` appears only in `subagents/` files (9,716 lines), never in
 a main session file. The main file holds the `Agent` call and its result (`agentId`, `status`);
 the subagent file holds the conversation, its first record being the prompt. Linked by the
-meta file's `toolUseId`.
+meta file's `toolUseId`: all 56 meta files name a `tool_use` id found in their parent session.
+The `Agent` call's result is usually the subagent's last reply, word for word, so the
+transcript shows it once.
+
+**Thinking.** 8,017 of 9,118 thinking blocks have empty text (only a signature), which settles
+leaving them out of the transcript for now.
+
+**Sessions without a title.** 11 of 70 have no `ai-title`. All are a few KB and hold only slash
+commands (`/model`, `/exit`) and their output, or start with a skill command. Their title is
+the first command (`/model opus`) when nothing was typed.
+
+**Terminal escapes.** Tool output keeps the colors and cursor moves commands printed (`cargo`,
+`git`). Drawn as they are they would act on the terminal, so every piece of session text is
+cleaned on the way in: escape sequences and control characters dropped, tabs made four
+spaces (`src/text.rs`).
 
 **Commits.** This is where assuming would have gone wrong. 656 Bash calls ran `git commit`,
 and only **one** result contains git's `[branch sha] subject` line: 640 used `git commit -q`,
@@ -167,7 +181,24 @@ The search bar works like levi's: nucleo-matcher, fzf syntax (`'exact`, `^prefix
 - Every atom must match within one haystack (the header, or a single entry), as in levi:
   `parser !test` finds an entry about the parser that doesn't mention tests.
 - Entries are long (a reply can be pages), and nucleo scores whole haystacks. An entry's
-  haystack is its first 2,000 characters; the rest is `/c`'s job. To be tuned with real data.
+  haystack is its first 2,000 characters; the rest is `/c`'s job.
+- **In prose, a fuzzy word must match compactly**: its matched characters within its length
+  plus 3. Tuned on real data (17,725 entries), because plain fuzzy matching over long text
+  matches nearly everything: `focus` matched 11,099 entries (63%), `parser` 71%, and the
+  nonsense `zzzzqqq` 77. Rules compared, entries kept:
+
+  | Query | fuzzy | substring | span ≤ 1.5n | span ≤ 2n | **span ≤ n+3** |
+  |---|---|---|---|---|---|
+  | `focus` | 11,099 | 190 | 193 | 225 | **194** |
+  | `focs` (typo) | 12,623 | 0 | 159 | 242 | **175** |
+  | `parser` | 12,618 | 72 | 132 | 198 | **132** |
+  | `crates` | 13,435 | 107 | 226 | 390 | **226** |
+  | `clipbord` (typo) | 7,381 | 0 | 54 | 54 | **50** |
+
+  n+3 stays close to what a substring finds but forgives typos, which substring doesn't.
+  Prose is prompts, replies and commands. Paths, titles and the header stay fully fuzzy,
+  since that's where abbreviations like `scbtn` for `src/components/Button.tsx` pay off.
+  Exact (`'`), anchored and negated words already match as written.
 - Paths use nucleo's path config; text the default one.
 - Dates are `YYYY-MM-DD` in local time, so `2026-10` narrows to a month.
 
@@ -226,7 +257,7 @@ Which commits a session produced, so either can lead to the other.
   indented one level, collapsed to its prompt, its tool calls and its last reply.
 - Compaction: a divider. Images: `[image]`.
 - Lines wrap (prose, unlike code, is unreadable scrolled sideways); diffs don't, and scroll
-  sideways as in levi.
+  sideways as in levi. (0.1.0 wraps diffs too; sideways scrolling comes with 0.2.0.)
 - A session loads in full on a worker when it's selected (the index keeps only what search
   needs) and stays in a small LRU. Stale loads are dropped, as levi drops stale diffs.
 
@@ -242,11 +273,11 @@ Which commits a session produced, so either can lead to the other.
 | `S-←/S-→` | scroll a diff sideways |
 | `Enter` | print the session id and quit |
 | `C-y` | copy the session id |
-| `C-e` | expand or collapse tool results |
+| `C-e` | expand or collapse tool results (0.2.0) |
 | `C-w` | delete the query's last word |
 | `Esc` | clear the query, or quit |
 | `C-c` | quit |
-| mouse | as levi: click, wheel, drag to copy, drag a seam to resize |
+| mouse | as levi: click, wheel, drag a seam to resize; drag to copy comes with 0.2.0 |
 
 ## CLI behaviour
 
@@ -267,7 +298,9 @@ Which commits a session produced, so either can lead to the other.
   ignored when that process is gone. Exit 0 with a reference, 1 with no ymir open.
 - `-h/--help`, `-V/-v/--version`. Unknown flags and extra arguments exit 2.
 - Preflight, one line on stderr, exit 1: `no sessions in ~/.claude/projects` (or the
-  `CLAUDE_CONFIG_DIR` one); `needs a terminal` for the TUI without one.
+  `CLAUDE_CONFIG_DIR` one); `needs a terminal` for the TUI without one. A missing projects
+  directory counts as having no sessions: `--filter` then exits 1 with no output, as for no
+  match, and `--show` says there's no such session.
 - `NO_COLOR` as in levi.
 
 ## Read-only, always
@@ -282,6 +315,9 @@ ymir reads `~/.claude` and runs read-only git commands; the only file it writes 
   in a temp dir, records every file's path, size, mtime and content hash (`.git/index`
   included), runs the binary through `--filter` (with `/c` and a sha), `--show`, `--focus`, and
   the TUI headless, then checks that nothing changed, appeared or disappeared.
+  In 0.1.0 (`tests/cli.rs`, `never_writes_where_it_reads`) it covers the sessions directory and
+  every command there is; the git repository joins it with git links, and `--focus` with its
+  note. Checked to fail by planting an `fs::write` in `store.rs`, as is the next test.
 - A second test reads `src/` and fails if `File::create`, `OpenOptions`, `fs::write`,
   `fs::remove` or `fs::rename` appear outside `focus.rs`, so a new write has to be argued for.
 
@@ -294,7 +330,8 @@ in code, never copied from real sessions. The README demo uses a made-up `CLAUDE
 
 ## Performance
 
-Measured on this machine (Apple M4 Pro, 12 cores), 2026-10-22, `~/.claude/projects`:
+Measured on this machine (Apple M4 Pro, 12 cores), 2026-10-22, `~/.claude/projects`, before
+any code:
 
 | | |
 |---|---|
@@ -318,7 +355,31 @@ Targets, to be measured like for like and kept in this file:
 - **Open a session < 100 ms** for the median, < 1 s for the largest.
 - **`/c` over everything < 1 s.**
 - **Memory**: the index holds prompts, replies and tool summaries, not results. Target
-  < 150 MB resident on this corpus; to be measured.
+  < 150 MB resident on this corpus.
+
+### Measured, 0.1.0 (2026-10-22)
+
+Same machine and corpus (70 sessions and 56 subagents, 545 MB; 510.6 MB in main files),
+release build, warm cache unless said. The `real_*` and `filter_speed` tests print these
+(sizes and timings only); `--filter` and the first screen are timed on the binary.
+
+| | target | measured |
+|---|---|---|
+| discover the files | | 0.5–1 ms |
+| full index, all cores | < 0.5 s | 55 ms (253 ms cold); `ymir --filter ''` 0.06 s end to end (0.27 s cold) |
+| entries indexed | | 17,674, 8.4 MB of text, 1,526 turns, 0 unreadable lines |
+| first screen, in a pty | < 100 ms | 15–45 ms |
+| refilter per keystroke | < 15 ms | 9–14 ms median, 14 ms worst (`commit message`) |
+| open a session | < 100 ms median, < 1 s largest | 0.7 ms median, 42 ms for the 170 MB one |
+| memory, `--filter ''` | < 150 MB | 38 MB resident |
+| binary | | 1.8 MB |
+
+Refiltering took 37–72 ms per keystroke at first. Two changes brought it down: matching each
+prose word once for its score and its positions together, rather than scoring and then
+finding the positions (17–30 ms); and cutting the work into slices of 256 entries instead of
+whole sessions, since one session can hold thousands of entries and kept a single core busy
+while the rest sat idle (9–14 ms). Narrowing (rescanning only the last hits as a query grows)
+works per session, and the numbers above are without it.
 
 ## Crates
 
@@ -362,6 +423,10 @@ tests/
                   a cut last line, a compaction, a subagent
 ```
 
+In 0.1.0, also `text.rs` (cleaning and wrapping session text), `clipboard.rs` and
+`layout.rs` (both from levi), and `tests/readonly.rs` (the source check). Not yet:
+`query.rs`, `grep.rs`, `git.rs`, `focus.rs`, `words.rs`, which come with their features.
+
 ## Build order
 
 Each step ends in a release with a CHANGELOG entry; commit messages carry the numbers.
@@ -370,8 +435,10 @@ Each step ends in a release with a CHANGELOG entry; commit messages carry the nu
    cut last line, wrappers, compaction). Then the three panes, fuzzy search, Enter prints the
    id, `--filter`, `--show`, the read-only test, CI (fmt, clippy `-D warnings`, tests on Linux
    and macOS, MSRV, `cargo deny`), `deny.toml`, README, CHANGELOG. Measure first screen, full
-   index, refilter, memory.
-2. **0.2.0** — diffs of edits in the transcript, changed words, `C-e`.
+   index, refilter, memory. **Done**, with diffs of edits already shown, in plain colors:
+   `--show` needed them.
+2. **0.2.0** — changed words in diffs, diffs scrolling sideways instead of wrapping, `C-e`,
+   drag to copy.
 3. **0.3.0** — `/c` literal search with hit jumps; `/h`.
 4. **0.4.0** — follow live sessions (stat poll, offsets), keeping the selection.
 5. **0.5.0** — git links, measured first against my 656 commit calls; `/g`, sha search.
