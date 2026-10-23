@@ -8,9 +8,12 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
+use std::ops::RangeInclusive;
+
 use crate::app::{self, App, Focus};
 use crate::index::Kind;
 use crate::record::PromptKind;
+use crate::text;
 use crate::time;
 use crate::transcript::{Item, Look};
 
@@ -157,6 +160,15 @@ fn follow(offset: &mut usize, selected: usize, height: usize) {
     }
 }
 
+/// Shows a list row the mouse dragged over in reverse video.
+fn mark<'a>(item: ListItem<'a>, rows: &Option<RangeInclusive<usize>>, i: usize) -> ListItem<'a> {
+    if rows.as_ref().is_some_and(|r| r.contains(&i)) {
+        item.style(Style::new().add_modifier(Modifier::REVERSED))
+    } else {
+        item
+    }
+}
+
 /// Renders rows `offset..` of a list whose items were built for that
 /// window only, so cost doesn't grow with the number of sessions.
 fn draw_window(
@@ -180,6 +192,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     follow(&mut app.offsets[0], app.selected, height);
     let offset = app.offsets[0];
     let end = (offset + height).min(app.view.len());
+    let marked = app.selection.and_then(|s| s.rows(Focus::Sessions));
     let mut items = Vec::with_capacity(end - offset);
     for i in offset..end {
         let s = &app.sessions[app.view[i].session];
@@ -188,8 +201,8 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("{when:>5} "),
             Style::new().dark_gray(),
         )];
+        let (name, title) = (s.name.clone(), s.title.clone());
         if s.ready {
-            let (name, title) = (s.name.clone(), s.title.clone());
             let name_marks = app.highlights(&name, false);
             let title_marks = app.highlights(&title, false);
             spans.extend(highlighted(
@@ -199,11 +212,11 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
             ));
             spans.push(Span::raw(" "));
             spans.extend(highlighted(&title, &title_marks, Style::new()));
-            items.push(ListItem::new(Line::from(spans_owned(spans))));
         } else {
             spans.push(Span::styled("…", Style::new().dark_gray()));
-            items.push(ListItem::new(Line::from(spans_owned(spans))));
         }
+        let item = ListItem::new(Line::from(spans_owned(spans)));
+        items.push(mark(item, &marked, i));
     }
     let title = " sessions ".to_owned();
     draw_window(
@@ -223,16 +236,17 @@ fn draw_turns(frame: &mut Frame, app: &mut App, area: Rect) {
     follow(&mut app.offsets[1], app.row, height);
     let offset = app.offsets[1];
     let end = (offset + height).min(rows.len());
+    let marked = app.selection.and_then(|s| s.rows(Focus::Turns));
     let mut items = Vec::new();
     if let Some(hit) = app.hit().cloned() {
         let session = app.sessions[hit.session].clone();
-        for &e in &rows[offset..end] {
+        for (i, &e) in (offset..end).zip(&rows[offset..end]) {
             let entry = &session.entries[e];
             let mut spans = vec![Span::styled(
                 format!("{:>3} ", entry.turn),
                 Style::new().dark_gray(),
             )];
-            let (mark, style) = match entry.kind {
+            let (lead, style) = match entry.kind {
                 _ if app::is_turn(&session, e) => {
                     let clock = entry.time.map(|t| time::local(t).clock());
                     (format!("{} ", clock.unwrap_or_default()), Style::new())
@@ -242,7 +256,7 @@ fn draw_turns(frame: &mut Frame, app: &mut App, area: Rect) {
                 Kind::Reply => ("  ● ".into(), Style::new()),
                 Kind::Tool { .. } => ("  ▸ ".into(), Style::new().fg(Color::Yellow)),
             };
-            spans.push(Span::styled(mark, Style::new().dark_gray()));
+            spans.push(Span::styled(lead, Style::new().dark_gray()));
             if let Some(tool) = &entry.tool {
                 spans.push(Span::styled(format!("{tool} "), style));
             }
@@ -253,7 +267,8 @@ fn draw_turns(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_path = matches!(entry.kind, Kind::Tool { is_path: true });
             let marks = app.highlights(&line, is_path);
             spans.extend(highlighted(&line, &marks, Style::new()));
-            items.push(ListItem::new(Line::from(spans_owned(spans))));
+            let item = ListItem::new(Line::from(spans_owned(spans)));
+            items.push(mark(item, &marked, i));
         }
     }
     let title = match app.hit() {
@@ -301,6 +316,34 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let block = pane(title, focused);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    mark_text(frame.buffer_mut(), app, inner);
+}
+
+/// Shows the transcript text dragged over in reverse video.
+fn mark_text(buf: &mut Buffer, app: &App, inner: Rect) {
+    let Some(sel) = app.selection else {
+        return;
+    };
+    let Some(selected) = sel.rows(Focus::Transcript) else {
+        return;
+    };
+    let (start, end) = sel.span();
+    let rows = app.wrapped_rows();
+    for (y, r) in (inner.y..inner.bottom()).zip(app.scroll..rows.len()) {
+        if !selected.contains(&r) {
+            continue;
+        }
+        let row = &rows[r];
+        // Only the text, not the indent before it or the space after.
+        let width = row.indent + text::columns(app.row_shown(row));
+        let from = if r == start.row { start.col } else { 0 }.max(row.indent);
+        let to = if r == end.row { end.col + 1 } else { width }.min(width);
+        for x in from..to.min(inner.width as usize) {
+            buf[(inner.x + x as u16, y)]
+                .modifier
+                .insert(Modifier::REVERSED);
+        }
+    }
 }
 
 /// The bytes `shown` of a transcript line, with a diff line's changed words
@@ -387,11 +430,14 @@ fn spans_owned(spans: Vec<Span<'_>>) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Msg;
     use crate::app::tests::{key, loaded, three, typed, wide};
     use crate::testutil::Claude;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     fn render_at(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -475,5 +521,82 @@ mod tests {
         let only_the_digit = [false, false, false, false, false, true, false, false];
         assert_eq!(reversed("-pin(3);"), only_the_digit);
         assert_eq!(reversed("+pin(5);"), only_the_digit);
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.update(Msg::Input(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })));
+    }
+
+    const LEFT: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+    const DRAG: MouseEventKind = MouseEventKind::Drag(MouseButton::Left);
+    const UP: MouseEventKind = MouseEventKind::Up(MouseButton::Left);
+
+    fn reversed(app: &mut App, x: u16, y: u16) -> bool {
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer()[(x, y)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    }
+
+    #[test]
+    fn dragging_over_sessions_copies_them_as_filter_prints_them() {
+        let claude = Claude::new();
+        three(&claude);
+        let mut app = loaded(&claude);
+        render_at(&mut app, 140, 20);
+        let sessions = app.panes[0];
+        let (x, top) = (sessions.x + 3, sessions.y + 1);
+        mouse(&mut app, LEFT, x, top);
+        mouse(&mut app, DRAG, x + 2, top + 1);
+        // Past the last session, the selection stops at it.
+        mouse(&mut app, DRAG, x, top + 10);
+        assert!(reversed(&mut app, x, top + 2), "shown while dragging");
+        mouse(&mut app, UP, x, top + 10);
+        let summaries: Vec<String> = app
+            .view
+            .iter()
+            .map(|h| crate::plain::summary(&app.sessions[h.session]))
+            .collect();
+        assert_eq!(app.take_clipboard(), Some(summaries.join("\n")));
+        assert_eq!(app.notice.as_deref(), Some("copied 3 sessions"));
+        assert!(reversed(&mut app, x, top + 2), "and after, until a key");
+        assert_eq!(app.selected, 0, "dragging doesn't move the selection");
+        key(&mut app, KeyCode::Down);
+        assert!(!reversed(&mut app, x, top + 2), "a key clears it");
+
+        // A click, without moving, selects a row but copies nothing.
+        mouse(&mut app, LEFT, x, top + 2);
+        mouse(&mut app, UP, x, top + 2);
+        assert_eq!(app.take_clipboard(), None);
+        assert_eq!((app.selection, app.selected), (None, 2));
+    }
+
+    #[test]
+    fn dragging_over_the_transcript_copies_the_text() {
+        let claude = Claude::new();
+        three(&claude);
+        let mut app = loaded(&claude);
+        render_at(&mut app, 140, 20);
+        let pane = app.panes[2];
+        let (x, top) = (pane.x + 1, pane.y + 1);
+        // From the prompt's first letter to the tool's name.
+        mouse(&mut app, LEFT, x + 2, top + 1);
+        mouse(&mut app, DRAG, x + 5, top + 3);
+        mouse(&mut app, UP, x + 5, top + 3);
+        assert_eq!(
+            app.take_clipboard().as_deref(),
+            Some("Reinforce the gate\n● claude\n▸ Ed")
+        );
+        assert_eq!(app.notice.as_deref(), Some("copied 3 lines"));
+        assert_eq!(app.focus, Focus::Transcript);
+        assert!(reversed(&mut app, x + 2, top + 1));
+        assert!(!reversed(&mut app, x + 1, top + 3), "not the indent");
+        assert!(!reversed(&mut app, x + 30, top + 1), "nor past the text");
     }
 }

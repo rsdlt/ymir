@@ -3,7 +3,7 @@
 //! tests play both parts.
 
 use std::collections::VecDeque;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use ratatui::layout::{Position, Rect};
 use crate::filter::{self, Filter, Hit};
 use crate::index::{Kind, Session};
 use crate::layout::{Resize, Seam, Splits};
+use crate::plain;
 use crate::store::SessionFile;
 use crate::text;
 use crate::time;
@@ -45,6 +46,15 @@ pub enum Focus {
 }
 
 impl Focus {
+    /// Its place in `App::panes`.
+    fn index(self) -> usize {
+        match self {
+            Focus::Sessions => 0,
+            Focus::Turns => 1,
+            Focus::Transcript => 2,
+        }
+    }
+
     fn next(self) -> Focus {
         match self {
             Focus::Sessions => Focus::Turns,
@@ -55,6 +65,43 @@ impl Focus {
 
     fn prev(self) -> Focus {
         self.next().next()
+    }
+}
+
+/// A mouse drag in one pane: whole rows of a list, or text of the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub pane: Focus,
+    /// Where the drag started.
+    pub anchor: Spot,
+    /// Where it is now.
+    pub head: Spot,
+}
+
+/// A place in a pane's content, not on screen, so scrolling doesn't move it:
+/// a list row and the screen column (which only tells a drag from a click),
+/// or a transcript row and the column in the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Spot {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl Selection {
+    /// Its two ends in reading order.
+    pub fn span(&self) -> (Spot, Spot) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    /// A click selects nothing; only moving away from where it started does.
+    pub fn dragged(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    /// The selected rows, once the mouse has moved.
+    pub fn rows(&self, pane: Focus) -> Option<RangeInclusive<usize>> {
+        let (start, end) = self.span();
+        (self.pane == pane && self.dragged()).then_some(start.row..=end.row)
     }
 }
 
@@ -129,6 +176,9 @@ pub struct App {
     pub body: Rect,
     resizing: Option<Resize>,
     seam_press: Option<(Seam, Instant)>,
+    /// What the mouse is dragging over. It stays shown after the drag, until
+    /// the next key or click.
+    pub selection: Option<Selection>,
 }
 
 impl App {
@@ -165,6 +215,7 @@ impl App {
             body: Rect::default(),
             resizing: None,
             seam_press: None,
+            selection: None,
         }
     }
 
@@ -173,6 +224,7 @@ impl App {
             Msg::Input(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                 self.notice = None;
                 self.handle_key(key);
+                self.selection = None;
             }
             Msg::Input(Event::Mouse(mouse)) => self.handle_mouse(mouse),
             Msg::Input(_) => {}
@@ -343,6 +395,10 @@ impl App {
                 .and_then(|w| w.rows.get(self.scroll))
                 .map(|r| r.item);
             self.wrapped = Some(wrap(&t, width));
+            // Its rows moved under it.
+            if self.selection.is_some_and(|s| s.pane == Focus::Transcript) {
+                self.selection = None;
+            }
             if !session {
                 self.column = 0;
             }
@@ -379,14 +435,18 @@ impl App {
         text::column_range(&item.text, self.column, self.column + room)
     }
 
+    /// The text of a row that's on screen, without its indent.
+    pub fn row_shown(&self, row: &Row) -> &str {
+        let Some(w) = &self.wrapped else {
+            return "";
+        };
+        &w.t.items[row.item].text[self.visible(row)]
+    }
+
     /// A row as it's shown, indent included.
     #[cfg(test)]
     pub fn row_text(&self, row: &Row) -> String {
-        let Some(w) = &self.wrapped else {
-            return String::new();
-        };
-        let text = &w.t.items[row.item].text[self.visible(row)];
-        format!("{}{text}", " ".repeat(row.indent))
+        format!("{}{}", " ".repeat(row.indent), self.row_shown(row))
     }
 
     pub fn take_clipboard(&mut self) -> Option<String> {
@@ -495,7 +555,11 @@ impl App {
             .wrapped
             .as_ref()
             .map_or(0, |w| w.wide.saturating_sub(w.width));
-        self.column = step(self.column, delta, last + 1);
+        let column = step(self.column, delta, last + 1);
+        if column != self.column && self.selection.is_some_and(|s| s.pane == Focus::Transcript) {
+            self.selection = None;
+        }
+        self.column = column;
     }
 
     /// Puts the next (or previous) prompt of yours at the top.
@@ -529,6 +593,9 @@ impl App {
                 self.resizing = None;
                 return;
             }
+            // A drag carries on wherever the pointer goes, even off its pane.
+            (MouseEventKind::Drag(MouseButton::Left), None) => return self.drag(mouse),
+            (MouseEventKind::Up(MouseButton::Left), None) => return self.release(),
             (MouseEventKind::Down(MouseButton::Left), _) => {
                 if let Some(resize) = Splits::seam_at(self.body, self.panes, at) {
                     return self.press_seam(resize);
@@ -548,13 +615,14 @@ impl App {
             MouseEventKind::ScrollLeft if transcript => self.scroll_sideways(-SIDE_STEP),
             MouseEventKind::ScrollDown if transcript && sideways => self.scroll_sideways(SIDE_STEP),
             MouseEventKind::ScrollUp if transcript && sideways => self.scroll_sideways(-SIDE_STEP),
-            MouseEventKind::ScrollDown if pane == Focus::Transcript => self.scroll_by(WHEEL_LINES),
-            MouseEventKind::ScrollUp if pane == Focus::Transcript => self.scroll_by(-WHEEL_LINES),
+            MouseEventKind::ScrollDown if transcript => self.scroll_by(WHEEL_LINES),
+            MouseEventKind::ScrollUp if transcript => self.scroll_by(-WHEEL_LINES),
             MouseEventKind::ScrollDown => self.move_in(pane, 1),
             MouseEventKind::ScrollUp => self.move_in(pane, -1),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.focus = pane;
                 self.notice = None;
+                self.selection = None;
                 // Clicks count only between the pane's borders.
                 let Some(inner) = inside(self.panes[i]).filter(|r| r.contains(at)) else {
                     return;
@@ -563,15 +631,149 @@ impl App {
                 let (current, len) = match pane {
                     Focus::Sessions => (self.selected, self.view.len()),
                     Focus::Turns => (self.row, self.rows().len()),
-                    Focus::Transcript => return,
+                    Focus::Transcript => {
+                        let spot = Spot {
+                            row: self.scroll + row,
+                            col: (mouse.column - inner.x) as usize,
+                        };
+                        self.selection = Some(Selection {
+                            pane,
+                            anchor: spot,
+                            head: spot,
+                        });
+                        return;
+                    }
                 };
                 let target = self.offsets[i] + row;
                 if target < len {
                     self.move_in(pane, target as isize - current as isize);
+                    let spot = Spot {
+                        row: target,
+                        col: mouse.column as usize,
+                    };
+                    self.selection = Some(Selection {
+                        pane,
+                        anchor: spot,
+                        head: spot,
+                    });
                 }
             }
             _ => {}
         }
+    }
+
+    /// Moves the end of the selection to the pointer, kept inside the pane.
+    /// Past the transcript's top or bottom edge, the transcript scrolls along.
+    fn drag(&mut self, mouse: MouseEvent) {
+        let Some(mut sel) = self.selection else {
+            return;
+        };
+        let Some(inner) = inside(self.panes[sel.pane.index()]) else {
+            return;
+        };
+        let (top, bottom) = (inner.y, inner.bottom() - 1);
+        let row = (mouse.row.clamp(top, bottom) - top) as usize;
+        let col = (mouse.column.clamp(inner.x, inner.right() - 1) - inner.x) as usize;
+        let (offset, len) = match sel.pane {
+            Focus::Sessions => (self.offsets[0], self.view.len()),
+            Focus::Turns => (self.offsets[1], self.rows().len()),
+            Focus::Transcript => {
+                if mouse.row < top {
+                    self.scroll_by(-1);
+                } else if mouse.row > bottom {
+                    self.scroll_by(1);
+                }
+                (self.scroll, self.wrapped_rows().len())
+            }
+        };
+        if len == 0 {
+            return;
+        }
+        sel.head = Spot {
+            row: (offset + row).min(len - 1),
+            col: match sel.pane {
+                Focus::Transcript => col,
+                _ => mouse.column as usize,
+            },
+        };
+        self.selection = Some(sel);
+    }
+
+    /// The end of a drag copies what it covered; a click selects nothing.
+    fn release(&mut self) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        if !sel.dragged() {
+            self.selection = None;
+            return;
+        }
+        if let Some((text, count, noun)) = self.selected_text(&sel) {
+            let plural = if count == 1 { "" } else { "s" };
+            self.notice = Some(format!("copied {count} {noun}{plural}"));
+            self.clipboard = Some(text);
+        }
+    }
+
+    /// What a selection copies, how many lines that is, and what to call
+    /// them. Sessions copy as `--filter` prints them, turns as their whole
+    /// lines; the transcript copies exactly what's selected, with lines
+    /// wrapped on screen joined back up.
+    fn selected_text(&self, sel: &Selection) -> Option<(String, usize, &'static str)> {
+        let (start, end) = sel.span();
+        let rows = start.row..=end.row;
+        let lines: Vec<String> = match sel.pane {
+            Focus::Sessions => self
+                .view
+                .get(rows)?
+                .iter()
+                .map(|h| plain::summary(&self.sessions[h.session]))
+                .collect(),
+            Focus::Turns => {
+                let session = self.session()?;
+                self.rows()
+                    .get(rows)?
+                    .iter()
+                    .map(|&e| session.entries[e].line().to_owned())
+                    .collect()
+            }
+            Focus::Transcript => {
+                let w = self.wrapped.as_ref()?;
+                let last = end.row.min(w.rows.len().checked_sub(1)?);
+                let mut lines: Vec<String> = Vec::new();
+                let mut prev = None;
+                for r in start.row..=last {
+                    let row = &w.rows[r];
+                    let shown = self.row_shown(row);
+                    let from = if r == start.row { start.col } else { 0 };
+                    let to = if r == end.row {
+                        end.col + 1
+                    } else {
+                        usize::MAX
+                    };
+                    let cut = text::column_range(
+                        shown,
+                        from.saturating_sub(row.indent),
+                        to.saturating_sub(row.indent),
+                    );
+                    let piece = &shown[cut];
+                    match lines.last_mut() {
+                        Some(line) if prev == Some(row.item) => line.push_str(piece),
+                        _ => lines.push(piece.to_owned()),
+                    }
+                    prev = Some(row.item);
+                }
+                lines
+            }
+        };
+        if lines.iter().all(|l| l.trim().is_empty()) {
+            return None;
+        }
+        let noun = match sel.pane {
+            Focus::Sessions => "session",
+            _ => "line",
+        };
+        Some((lines.join("\n"), lines.len(), noun))
     }
 
     /// Starts dragging a seam, or on a second press soon after the first,
@@ -953,5 +1155,23 @@ pub mod tests {
         app.wrap_transcript(60);
         assert_eq!(app.wrapped_rows().len(), cut);
         assert_eq!(top(&app), "  Count to 30, take 1");
+    }
+
+    #[test]
+    fn a_wrapped_line_copies_as_one() {
+        let claude = Claude::new();
+        three(&claude);
+        let mut app = loaded(&claude);
+        // "Reinforce " and "the gate", on two rows.
+        app.wrap_transcript(14);
+        let sel = Selection {
+            pane: Focus::Transcript,
+            anchor: Spot { row: 1, col: 0 },
+            head: Spot { row: 2, col: 20 },
+        };
+        assert_eq!(
+            app.selected_text(&sel),
+            Some(("Reinforce the gate".into(), 1, "line"))
+        );
     }
 }
