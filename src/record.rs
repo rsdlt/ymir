@@ -70,6 +70,8 @@ struct Block<'a> {
     kind: Option<&'a RawValue>,
     #[serde(borrow)]
     text: Option<&'a RawValue>,
+    #[serde(borrow)]
+    thinking: Option<&'a RawValue>,
     // tool_use
     #[serde(borrow)]
     id: Option<&'a RawValue>,
@@ -131,6 +133,9 @@ pub enum Piece {
     },
     /// Claude's text.
     Reply(String),
+    /// Claude's thinking, when the file has its text. Only read when asked
+    /// for (`Detail::Full`).
+    Thinking(String),
     Tool(Call),
     /// A tool's output. Only read when asked for (`Detail::Full`).
     Result(Output),
@@ -228,7 +233,7 @@ pub fn read(line: &[u8], detail: Detail) -> Option<Line> {
     match string(raw.kind)?.as_ref() {
         "user" if flag(raw.meta) || flag(raw.compact_summary) => {}
         "user" => user(&raw, detail, &mut out.pieces),
-        "assistant" => assistant(&raw, &mut out.pieces),
+        "assistant" => assistant(&raw, detail, &mut out.pieces),
         "system" if string(raw.subtype).as_deref() == Some("compact_boundary") => {
             let meta: CompactMeta = raw
                 .compact
@@ -382,7 +387,7 @@ fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     Some(text[start..end].trim())
 }
 
-fn assistant(raw: &Raw, out: &mut Vec<Piece>) {
+fn assistant(raw: &Raw, detail: Detail, out: &mut Vec<Piece>) {
     let blocks = match content(raw) {
         Some(Content::Blocks(blocks)) => blocks,
         Some(Content::Text(text)) => {
@@ -399,8 +404,13 @@ fn assistant(raw: &Raw, out: &mut Vec<Piece>) {
                 }
             }
             Some("tool_use") => out.push(Piece::Tool(call(&block))),
-            // Thinking is mostly empty in the files (8,017 of 9,118 blocks)
-            // and noise for reading back; see the plan.
+            // Mostly empty in the files (8,627 of 9,835 blocks), and not
+            // searched fuzzily; see the plan.
+            Some("thinking") if detail == Detail::Full => {
+                if let Some(text) = string(block.thinking).filter(|t| !t.trim().is_empty()) {
+                    out.push(Piece::Thinking(text.trim().to_owned()));
+                }
+            }
             _ => {}
         }
     }
@@ -673,6 +683,17 @@ mod tests {
                 json!({"type": "thinking", "thinking": "", "signature": "x"})
             )),
             []
+        );
+        let thought =
+            assistant(json!({"type": "thinking", "thinking": "The pin. ", "signature": "x"}));
+        assert_eq!(
+            pieces(thought.clone()),
+            [Piece::Thinking("The pin.".into())]
+        );
+        assert_eq!(
+            line(thought, Detail::Index).unwrap().pieces,
+            [],
+            "not indexed"
         );
         let bash = pieces(assistant(
             json!({"type": "tool_use", "id": "toolu_1", "name": "Bash",

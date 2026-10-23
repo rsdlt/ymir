@@ -104,6 +104,12 @@ pub fn reply(text: &str) -> String {
     reply_at(text, "2026-01-01T10:00:01.000Z")
 }
 
+pub fn thinking(text: &str) -> String {
+    json!({"parentUuid": "u", "type": "assistant", "timestamp": "2026-01-01T10:00:01.000Z", "cwd": "/w/paradis",
+           "message": {"id": "msg", "role": "assistant", "content": [{"type": "thinking", "thinking": text, "signature": "x"}]}})
+    .to_string()
+}
+
 pub fn reply_at(text: &str, at: &str) -> String {
     json!({"parentUuid": "u", "type": "assistant", "timestamp": at, "cwd": "/w/paradis",
            "message": {"id": "msg", "role": "assistant", "content": [{"type": "text", "text": text}]}})

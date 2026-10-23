@@ -37,6 +37,7 @@ pub enum Look {
     Divider,
     /// A subagent's prompt.
     Agent,
+    Thinking,
 }
 
 impl Look {
@@ -81,26 +82,27 @@ pub struct Limits {
     pub output: usize,
     /// Lines of one file's diff.
     pub diff: usize,
-    /// Whether a file a call created is shown whole, or by its size.
-    pub created: bool,
+    /// Whether thinking, multi-line commands and files a call created are
+    /// shown whole, or not at all, by their first line, and by their size.
+    pub whole: bool,
 }
 
 impl Limits {
     pub const SCREEN: Limits = Limits {
         output: 6,
         diff: 400,
-        created: false,
+        whole: false,
     };
     /// The screen with `C-e`: everything.
     pub const FULL: Limits = Limits {
         output: usize::MAX,
         diff: usize::MAX,
-        created: true,
+        whole: true,
     };
     pub const PLAIN: Limits = Limits {
         output: 20,
         diff: 2000,
-        created: false,
+        whole: false,
     };
 }
 
@@ -203,18 +205,24 @@ impl Builder {
                     self.push(Look::Claude, "● claude", 0, None);
                     self.claude_speaking = true;
                 }
-                let mut summary = match cwd {
-                    Some(cwd) if call.is_path => index::relative(&call.summary, cwd).to_owned(),
-                    _ => call.summary.clone(),
+                let summary = match cwd {
+                    Some(cwd) if call.is_path => index::relative(&call.summary, cwd),
+                    _ => &call.summary,
                 };
-                if summary.contains('\n') {
-                    summary = format!("{} …", summary.lines().next().unwrap_or_default());
-                }
-                let mut line = format!("▸ {} {summary}", call.name);
+                let mut lines = summary.lines();
+                let first = lines.next().unwrap_or_default();
+                let more = summary.contains('\n') && !self.limits.whole;
+                let mut line = format!("▸ {} {first}{}", call.name, if more { " …" } else { "" });
                 if let Some(agent) = &call.agent {
                     line.push_str(&format!(" ({agent})"));
                 }
                 self.push(Look::Tool, line.trim_end(), base + 2, Some(entry));
+                if self.limits.whole {
+                    // The rest of a multi-line command, under its first line.
+                    for rest in lines {
+                        self.push(Look::Tool, rest, base + 4, None);
+                    }
+                }
                 if call.agent.is_some() || matches!(call.name.as_str(), "Agent" | "Task") {
                     self.agents.insert(call.id);
                 } else {
@@ -240,6 +248,15 @@ impl Builder {
                     self.output(base + 4, &out, cwd);
                 }
             },
+            Piece::Thinking(text) if self.limits.whole => {
+                self.new_part();
+                if depth == 0 && !self.claude_speaking {
+                    self.push(Look::Claude, "● claude", 0, None);
+                    self.claude_speaking = true;
+                }
+                self.push(Look::Thinking, &format!("∴ {text}"), base + 2, None);
+            }
+            Piece::Thinking(_) => {}
             Piece::Notice(text) => {
                 self.new_part();
                 self.push(Look::Notice, &text, base + 2, None);
@@ -306,7 +323,7 @@ impl Builder {
             None => format!("{path} · +{added} -{removed}"),
         };
         self.push(Look::File, &head, indent, None);
-        if edit.created.is_some() && !self.limits.created {
+        if edit.created.is_some() && !self.limits.whole {
             // A new file's content is the whole file; its size says enough.
             return;
         }
@@ -573,6 +590,31 @@ mod tests {
         let file: Vec<_> = t.items[4..8].iter().map(|i| i.text.as_str()).collect();
         assert_eq!(file, ["new.rs · created, 3 lines", "+a", "+b", "+c"]);
         assert_eq!(t.items[5].look, Look::Added);
+    }
+
+    #[test]
+    fn full_limits_show_thinking_and_whole_commands() {
+        let claude = Claude::new();
+        let file = claude.session(
+            "-w",
+            "aaaa0006",
+            &[
+                claude.prompt("go", "2026-01-01T10:00:00Z"),
+                testutil::thinking("The pin is short."),
+                claude.tool("t1", "Bash", json!({"command": "cd gate\ncargo test"})),
+            ],
+        );
+        let lines = |limits| text(&load(&file, limits).unwrap())[2..].to_vec();
+        assert_eq!(lines(Limits::SCREEN), ["● claude", "  ▸ Bash cd gate …"]);
+        assert_eq!(
+            lines(Limits::FULL),
+            [
+                "● claude",
+                "  ∴ The pin is short.",
+                "  ▸ Bash cd gate",
+                "    cargo test"
+            ]
+        );
     }
 
     #[test]

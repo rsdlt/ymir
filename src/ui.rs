@@ -388,6 +388,7 @@ fn look_style(look: Look) -> Style {
         Look::Removed => Style::new().fg(Color::Red),
         Look::Divider => Style::new().dark_gray(),
         Look::Agent => Style::new().fg(Color::Blue),
+        Look::Thinking => Style::new().dark_gray().italic(),
     }
 }
 
