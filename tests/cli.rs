@@ -180,6 +180,35 @@ fn filter_exits_1_when_nothing_matches() {
 }
 
 #[test]
+fn filter_searches_text_with_c() {
+    let dir = claude();
+    // Tool output inside a subagent, which fuzzy search leaves out.
+    let out = ymir(dir.path(), &["--filter", "/c east.rs"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).starts_with(NORTH_GATE), "{}", stdout(&out));
+    assert_eq!(stdout(&out).lines().count(), 1);
+    // The fuzzy part picks the sessions to search.
+    let out = ymir(dir.path(), &["--filter", "forest /c east.rs"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    // Smart case.
+    let out = ymir(dir.path(), &["--filter", "/c EAST.rs"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+#[test]
+fn filter_here_keeps_sessions_from_this_directory() {
+    let dir = claude();
+    // Run from a directory none of the sessions worked in.
+    let out = Command::new(env!("CARGO_BIN_EXE_ymir"))
+        .args(["--filter", "/h"])
+        .env("CLAUDE_CONFIG_DIR", dir.path())
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+#[test]
 fn show_prints_a_transcript() {
     let dir = claude();
     let out = ymir(dir.path(), &["--show", NORTH_GATE]);
@@ -265,6 +294,8 @@ fn never_writes_where_it_reads() {
         &["--filter", ""],
         &["--filter", "gate"],
         &["--filter", NORTH_GATE],
+        &["--filter", "/c gate"],
+        &["--filter", "/h"],
         &["--show", NORTH_GATE],
         &["--show", FOREST_MAP, "--turn", "1"],
         &["--show", "nope"],

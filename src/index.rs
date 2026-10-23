@@ -56,6 +56,8 @@ pub struct Session {
     pub project: String,
     /// The last part of `project`.
     pub name: String,
+    /// Every directory it worked in, as recorded.
+    pub cwds: Vec<String>,
     pub branch: String,
     pub title: String,
     pub started: Option<i64>,
@@ -74,6 +76,7 @@ impl Session {
             ready: false,
             project: String::new(),
             name: String::new(),
+            cwds: Vec::new(),
             branch: String::new(),
             title: String::new(),
             started: None,
@@ -82,6 +85,15 @@ impl Session {
             turns: 0,
             bad: 0,
         }
+    }
+
+    /// Whether it worked in `dir` or anywhere under it.
+    pub fn worked_in(&self, dir: &str) -> bool {
+        let dir = dir.trim_end_matches('/');
+        self.cwds.iter().any(|c| {
+            c.strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
     }
 
     pub fn load(file: SessionFile) -> io::Result<Session> {
@@ -94,6 +106,11 @@ impl Session {
             if step.depth == 0 {
                 if cwd.is_none() {
                     cwd = step.cwd.map(str::to_owned);
+                }
+                if let Some(c) = step.cwd
+                    && !s.cwds.iter().any(|seen| seen == c)
+                {
+                    s.cwds.push(c.to_owned());
                 }
                 if s.branch.is_empty()
                     && let Some(branch) = step.branch

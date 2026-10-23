@@ -1,13 +1,15 @@
 //! Background threads. Everything reports back to the UI through one `Msg` channel.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, MouseButton, MouseEventKind};
 
-use crate::app::Msg;
+use crate::app::{CodeRequest, Msg};
+use crate::grep;
 use crate::index::{self, Session};
 use crate::store::SessionFile;
 use crate::transcript::{self, Limits};
@@ -79,4 +81,49 @@ pub fn spawn_transcripts(tx: Sender<Msg>) -> Sender<(SessionFile, Limits)> {
         }
     });
     req_tx
+}
+
+/// Runs `/c` searches, one at a time: starting one stops the last.
+pub struct CodeSearcher {
+    tx: Sender<Msg>,
+    /// Generation of the search that should be running; 0 stops them all.
+    current: Arc<AtomicU64>,
+}
+
+impl CodeSearcher {
+    pub fn new(tx: Sender<Msg>) -> CodeSearcher {
+        CodeSearcher {
+            tx,
+            current: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Stops the running search before it takes another session.
+    pub fn cancel(&self) {
+        self.current.store(0, Ordering::SeqCst);
+    }
+
+    pub fn start(&self, req: CodeRequest) {
+        let CodeRequest {
+            generation,
+            pattern,
+            sessions,
+            files,
+        } = req;
+        self.current.store(generation, Ordering::SeqCst);
+        let (tx, current) = (self.tx.clone(), self.current.clone());
+        thread::spawn(move || {
+            let live = || current.load(Ordering::SeqCst) == generation;
+            grep::search(&files, &pattern, live, |i, found| {
+                // A session that can't be read has nothing to find.
+                let found = found.unwrap_or_default();
+                if live() {
+                    let _ = tx.send(Msg::Code(generation, sessions[i], found));
+                }
+            });
+            if live() {
+                let _ = tx.send(Msg::CodeDone(generation));
+            }
+        });
+    }
 }

@@ -32,6 +32,15 @@ pub fn home() -> Option<PathBuf> {
 }
 
 /// `path` with the home directory written `~`.
+/// Where `/h` looks: the repository `dir` is in, or `dir` itself outside
+/// one. Only looks for a `.git`, without running git.
+pub fn here(dir: &Path) -> PathBuf {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(dir)
+        .to_path_buf()
+}
+
 pub fn tilde(path: &str) -> String {
     match home() {
         Some(home) => {

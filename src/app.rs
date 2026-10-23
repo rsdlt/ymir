@@ -2,7 +2,7 @@
 //! threads in here: workers send `Msg`s, `main` hands out requests, and
 //! tests play both parts.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,9 +13,11 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 
 use crate::filter::{self, Filter, Hit};
+use crate::grep::{self, Found};
 use crate::index::{Kind, Session};
 use crate::layout::{Resize, Seam, Splits};
 use crate::plain;
+use crate::query::{self, Query};
 use crate::store::SessionFile;
 use crate::text;
 use crate::time;
@@ -28,6 +30,10 @@ const WHEEL_LINES: isize = 3;
 /// Columns one sideways scroll of a diff moves, by key or wheel.
 const SIDE_STEP: isize = 8;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// A `/c` search starts once typing pauses this long, not on every key.
+pub const CODE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Rows kept above a `/c` hit when the transcript jumps to it.
+const JUMP_CONTEXT: usize = 3;
 
 pub enum Msg {
     Input(Event),
@@ -36,6 +42,40 @@ pub enum Msg {
     /// Every session has been read.
     IndexDone,
     Transcript(String, Result<Arc<Transcript>, String>),
+    /// What the `/c` search with this generation found in a session, by its
+    /// place in the list.
+    Code(u64, usize, Found),
+    /// That search went through every session.
+    CodeDone(u64),
+}
+
+/// A `/c` search: the text, and what it has found so far.
+pub struct Code {
+    pub pattern: String,
+    generation: u64,
+    typed_at: Instant,
+    /// Handed out to run.
+    started: bool,
+    /// By place in the session list.
+    found: HashMap<usize, Found>,
+    pub searched: usize,
+    pub total: usize,
+    pub finished: bool,
+}
+
+impl Code {
+    /// Occurrences found so far, in every session.
+    pub fn hits(&self) -> usize {
+        self.found.values().map(|f| f.hits).sum()
+    }
+}
+
+/// A `/c` search for `main` to run: which sessions, by place in the list.
+pub struct CodeRequest {
+    pub generation: u64,
+    pub pattern: String,
+    pub sessions: Vec<usize>,
+    pub files: Vec<SessionFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,13 +172,28 @@ struct Wrapped {
     starts: Vec<usize>,
     /// Columns the widest diff line needs, indent included.
     wide: usize,
+    /// The `/c` text it was wrapped for, and the rows its hits start on.
+    pattern: Option<String>,
+    hits: Vec<usize>,
 }
 
 pub struct App {
     pub query: String,
     filter: Filter,
     /// The query `view` was filtered with; `None` when it must be redone.
-    filtered: Option<String>,
+    filtered: Option<Query>,
+    /// What the fuzzy part and `/h` matched, before `/c` narrows it.
+    matched: Vec<Hit>,
+    /// Where `/h` looks: the current repository, or directory.
+    pub here: Option<String>,
+    pub code: Option<Code>,
+    code_generation: u64,
+    /// Running searches must stop.
+    code_cancel: bool,
+    /// `/c` found more; the view must be made again.
+    code_dirty: bool,
+    /// The `/c` hit the transcript last moved to, as a row.
+    at_hit: Option<usize>,
     pub sessions: Vec<Session>,
     /// Still being read.
     pub indexing: bool,
@@ -188,6 +243,13 @@ impl App {
             query: String::new(),
             filter: Filter::new(),
             filtered: None,
+            matched: Vec::new(),
+            here: None,
+            code: None,
+            code_generation: 0,
+            code_cancel: false,
+            code_dirty: false,
+            at_hit: None,
             indexing: !sessions.is_empty(),
             sessions,
             view: Vec::new(),
@@ -247,45 +309,169 @@ impl App {
                 }
                 Err(e) => self.failed = Some((id, e)),
             },
+            Msg::Code(generation, session, found) => {
+                if let Some(code) = self.code.as_mut().filter(|c| c.generation == generation) {
+                    code.searched += 1;
+                    if found.hits > 0 {
+                        code.found.insert(session, found);
+                        self.code_dirty = true;
+                    }
+                }
+            }
+            Msg::CodeDone(generation) => {
+                if let Some(code) = self.code.as_mut().filter(|c| c.generation == generation) {
+                    code.finished = true;
+                }
+            }
         }
     }
 
     /// Brings the view up to date with the query: once per frame, so a burst
     /// of keys costs one filter.
     pub fn settle(&mut self) {
-        let query = self.query.trim().to_owned();
-        if self.filtered.as_deref() == Some(query.as_str()) {
+        let parsed = query::parse(self.query.trim());
+        let fresh = self.filtered.as_ref() != Some(&parsed);
+        if !fresh && !self.code_dirty {
             return;
         }
-        let keep = self.session().map(|s| s.file.id.clone());
-        let narrows = self.filtered.is_some() && self.filter.set_query(&query);
-        if !narrows {
-            self.filter.set_query(&query);
+        let keep = self
+            .hit()
+            .map(|h| (self.sessions[h.session].file.id.clone(), h.entries.clone()));
+        if fresh {
+            let old = self.filtered.take();
+            let same_fuzzy = old
+                .as_ref()
+                .is_some_and(|o| o.fuzzy == parsed.fuzzy && o.here == parsed.here);
+            if !same_fuzzy {
+                // Turning `/h` off widens the search, whatever the words do.
+                let narrows = old.as_ref().is_some_and(|o| parsed.here || !o.here)
+                    && self.filter.set_query(&parsed.fuzzy);
+                if !narrows {
+                    self.filter.set_query(&parsed.fuzzy);
+                }
+                let mut candidates: Vec<usize> = if narrows {
+                    self.matched.iter().map(|h| h.session).collect()
+                } else {
+                    (0..self.sessions.len()).collect()
+                };
+                candidates.sort_unstable();
+                if let Some(dir) = self.here.as_deref().filter(|_| parsed.here) {
+                    candidates.retain(|&i| self.sessions[i].worked_in(dir));
+                }
+                self.matched = filter::par_matches(&parsed.fuzzy, &self.sessions, &candidates);
+                filter::sort(&mut self.matched);
+            }
+            // Other words, or other sessions to search: the search starts over.
+            let same_code = same_fuzzy && old.as_ref().is_some_and(|o| o.code == parsed.code);
+            if !same_code {
+                self.restart_code(parsed.code.clone());
+            }
+            self.filtered = Some(parsed);
         }
-        let candidates: Vec<usize> = if narrows {
-            let mut c: Vec<_> = self.view.iter().map(|h| h.session).collect();
-            c.sort_unstable();
-            c
-        } else {
-            (0..self.sessions.len()).collect()
+        self.code_dirty = false;
+        self.view = match &self.code {
+            None => self.matched.clone(),
+            // In the fuzzy order, so sessions don't move as hits come in.
+            Some(code) => self
+                .matched
+                .iter()
+                .filter_map(|h| {
+                    let found = code.found.get(&h.session)?;
+                    Some(Hit {
+                        session: h.session,
+                        score: h.score,
+                        entries: Some(found.entries.clone()),
+                    })
+                })
+                .collect(),
         };
-        self.view = filter::par_matches(&query, &self.sessions, &candidates);
-        filter::sort(&mut self.view);
-        self.filtered = Some(query);
-        // The same session stays selected when it's still there.
-        let at = keep.and_then(|id| {
+        // The same session stays selected when it's still there, and where it
+        // was in it, when its rows didn't change.
+        let at = keep.as_ref().and_then(|(id, _)| {
             self.view
                 .iter()
-                .position(|h| self.sessions[h.session].file.id == id)
+                .position(|h| &self.sessions[h.session].file.id == id)
         });
         match at {
-            Some(i) if i == self.selected => self.select_row(0),
+            Some(i)
+                if i == self.selected && keep.is_some_and(|(_, e)| e == self.view[i].entries) => {}
             Some(i) => {
                 self.selected = i;
                 self.select_row(0);
             }
             None => self.select(0),
         }
+    }
+
+    /// Drops the current `/c` search and prepares `pattern`, if any. It's
+    /// handed out by `take_code_request` once typing pauses.
+    fn restart_code(&mut self, pattern: Option<String>) {
+        self.code_cancel = true;
+        self.at_hit = None;
+        self.code = pattern.map(|pattern| {
+            self.code_generation += 1;
+            Code {
+                pattern,
+                generation: self.code_generation,
+                typed_at: Instant::now(),
+                started: false,
+                found: HashMap::new(),
+                searched: 0,
+                total: 0,
+                finished: false,
+            }
+        });
+    }
+
+    /// Whether running searches must stop. Asks once.
+    pub fn take_code_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.code_cancel)
+    }
+
+    /// The `/c` search to start, once typing paused for `CODE_DEBOUNCE` and
+    /// every session is indexed: over the sessions the rest of the query
+    /// matched, best first.
+    pub fn take_code_request(&mut self, now: Instant) -> Option<CodeRequest> {
+        self.settle();
+        if self.indexing {
+            return None;
+        }
+        let code = self.code.as_mut()?;
+        if code.started || now < code.typed_at + CODE_DEBOUNCE {
+            return None;
+        }
+        code.started = true;
+        let sessions: Vec<usize> = self.matched.iter().map(|h| h.session).collect();
+        code.total = sessions.len();
+        code.finished = sessions.is_empty();
+        let files = sessions
+            .iter()
+            .map(|&i| self.sessions[i].file.clone())
+            .collect();
+        Some(CodeRequest {
+            generation: code.generation,
+            pattern: code.pattern.clone(),
+            sessions,
+            files,
+        })
+    }
+
+    /// When a pending `/c` search is due, for `main` to wake up then.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.code
+            .as_ref()
+            .filter(|c| !c.started)
+            .map(|c| c.typed_at + CODE_DEBOUNCE)
+    }
+
+    /// The `/c` text, while there's one.
+    pub fn pattern(&self) -> Option<&str> {
+        self.code.as_ref().map(|c| c.pattern.as_str())
+    }
+
+    /// Whether the query has `/h`.
+    pub fn is_here(&self) -> bool {
+        self.filtered.as_ref().is_some_and(|q| q.here)
     }
 
     pub fn hit(&self) -> Option<&Hit> {
@@ -327,8 +513,10 @@ impl App {
         self.ask_transcript();
     }
 
+    /// What transcripts are read with. A `/c` hit can be anywhere, so with
+    /// one, everything is shown.
     fn limits(&self) -> Limits {
-        if self.expanded {
+        if self.expanded || self.code.is_some() {
             Limits::FULL
         } else {
             Limits::SCREEN
@@ -381,10 +569,11 @@ impl App {
         let Ok(t) = self.transcript().cloned() else {
             return;
         };
+        let pattern = self.pattern().map(str::to_owned);
         let stale = self
             .wrapped
             .as_ref()
-            .is_none_or(|w| !Arc::ptr_eq(&w.t, &t) || w.width != width);
+            .is_none_or(|w| !Arc::ptr_eq(&w.t, &t) || w.width != width || w.pattern != pattern);
         if stale {
             let session = self.wrapped.as_ref().is_some_and(|w| w.t.id == t.id);
             // Keep the line on top when only the width changed.
@@ -394,7 +583,7 @@ impl App {
                 .filter(|w| Arc::ptr_eq(&w.t, &t))
                 .and_then(|w| w.rows.get(self.scroll))
                 .map(|r| r.item);
-            self.wrapped = Some(wrap(&t, width));
+            self.wrapped = Some(wrap(&t, width, pattern));
             // Its rows moved under it.
             if self.selection.is_some_and(|s| s.pane == Focus::Transcript) {
                 self.selection = None;
@@ -410,7 +599,14 @@ impl App {
         }
         let wrapped = self.wrapped.as_ref().unwrap();
         if let Some(entry) = self.follow.take() {
-            self.scroll = t.entries.get(entry).map_or(0, |&item| wrapped.starts[item]);
+            let start = t.entries.get(entry).map_or(0, |&item| wrapped.starts[item]);
+            self.scroll = start;
+            // Under `/c`, on to the entry's first hit, which may be far down
+            // its output.
+            self.at_hit = wrapped.hits.iter().copied().find(|&h| h >= start);
+            if let Some(hit) = self.at_hit {
+                self.scroll = hit.saturating_sub(JUMP_CONTEXT).max(start);
+            }
         }
         self.scroll = self.scroll.min(wrapped.rows.len().saturating_sub(1));
         self.column = self.column.min(wrapped.wide.saturating_sub(width));
@@ -525,6 +721,27 @@ impl App {
     fn scroll_by(&mut self, delta: isize) {
         let rows = self.wrapped.as_ref().map_or(0, |w| w.rows.len());
         self.scroll = step(self.scroll, delta, rows);
+        self.at_hit = None;
+    }
+
+    /// Under `/c`, moves to the next (or previous) hit, a few rows below the
+    /// top. Returns false without one to move to.
+    fn jump_hit(&mut self, forward: bool) -> bool {
+        let Some(w) = self.wrapped.as_ref().filter(|w| w.pattern.is_some()) else {
+            return false;
+        };
+        let hits = w.hits.iter().copied();
+        let target = match (self.at_hit, forward) {
+            (Some(at), true) => hits.into_iter().find(|&h| h > at),
+            (None, true) => hits.into_iter().find(|&h| h >= self.scroll),
+            (Some(at), false) => hits.into_iter().rev().find(|&h| h < at),
+            (None, false) => hits.into_iter().rev().find(|&h| h < self.scroll),
+        };
+        if let Some(hit) = target {
+            self.scroll = hit.saturating_sub(JUMP_CONTEXT);
+            self.at_hit = Some(hit);
+        }
+        true
     }
 
     /// Shows tool output in full, or cut again, keeping the entry on top
@@ -564,6 +781,9 @@ impl App {
 
     /// Puts the next (or previous) prompt of yours at the top.
     fn jump_turn(&mut self, forward: bool) {
+        if self.jump_hit(forward) {
+            return;
+        }
         let (Ok(t), Some(w)) = (self.transcript().cloned(), self.wrapped.as_ref()) else {
             return;
         };
@@ -806,12 +1026,29 @@ pub fn is_turn(session: &Session, entry: usize) -> bool {
         .is_some_and(|e| e.depth == 0 && matches!(e.kind, Kind::Prompt(_)))
 }
 
-fn wrap(t: &Arc<Transcript>, width: usize) -> Wrapped {
-    let mut rows = Vec::new();
+fn wrap(t: &Arc<Transcript>, width: usize, pattern: Option<String>) -> Wrapped {
+    let mut rows: Vec<Row> = Vec::new();
     let mut starts = Vec::with_capacity(t.items.len());
     let mut wide = 0;
+    let mut hits = Vec::new();
     for (i, item) in t.items.iter().enumerate() {
-        starts.push(rows.len());
+        let first = rows.len();
+        starts.push(first);
+        // Rows are added below; the hits are placed once they are.
+        let found = pattern
+            .as_deref()
+            .map(|p| grep::find(&item.text, p))
+            .unwrap_or_default();
+        let place = |rows: &[Row], hits: &mut Vec<usize>| {
+            for hit in &found {
+                let row = (first..rows.len())
+                    .rfind(|&r| rows[r].span.start <= hit.start)
+                    .unwrap_or(first);
+                if hits.last() != Some(&row) {
+                    hits.push(row);
+                }
+            }
+        };
         // Keep at least a few columns for the text, however deep it sits.
         let indent = item.indent.min(width.saturating_sub(8));
         if item.look.is_diff() {
@@ -821,6 +1058,7 @@ fn wrap(t: &Arc<Transcript>, width: usize) -> Wrapped {
                 span: 0..item.text.len(),
                 indent,
             });
+            place(&rows, &mut hits);
             continue;
         }
         for span in text::wrap(&item.text, width - indent) {
@@ -830,6 +1068,7 @@ fn wrap(t: &Arc<Transcript>, width: usize) -> Wrapped {
                 indent,
             });
         }
+        place(&rows, &mut hits);
     }
     Wrapped {
         t: t.clone(),
@@ -837,6 +1076,8 @@ fn wrap(t: &Arc<Transcript>, width: usize) -> Wrapped {
         rows,
         starts,
         wide,
+        pattern,
+        hits,
     }
 }
 
@@ -1173,5 +1414,151 @@ pub mod tests {
             app.selected_text(&sel),
             Some(("Reinforce the gate".into(), 1, "line"))
         );
+    }
+
+    /// Runs the `/c` search the app asks for, as `main` would once typing
+    /// paused.
+    pub fn run_code(app: &mut App) {
+        let later = Instant::now() + CODE_DEBOUNCE;
+        app.take_code_cancel();
+        while let Some(req) = app.take_code_request(later) {
+            let found = std::sync::Mutex::new(Vec::new());
+            grep::search(
+                &req.files,
+                &req.pattern,
+                || true,
+                |i, f| {
+                    found.lock().unwrap().push((req.sessions[i], f.unwrap()));
+                },
+            );
+            for (session, f) in found.into_inner().unwrap() {
+                app.update(Msg::Code(req.generation, session, f));
+            }
+            app.update(Msg::CodeDone(req.generation));
+            app.settle();
+            serve(app);
+        }
+    }
+
+    /// Two sessions; only the first says "hinge pin", twice, deep in a tool's
+    /// output and in a reply.
+    fn hinges(claude: &Claude) {
+        let mut output: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
+        output[30] = "the hinge pin is short".into();
+        claude.session(
+            "-w-paradis",
+            "11111111-aaaa",
+            &[
+                claude.prompt("Why does the gate stick?", "2026-01-01T10:00:00Z"),
+                claude.tool("t1", "Bash", json!({"command": "cargo test"})),
+                testutil::result("t1", &output.join("\n"), json!({})),
+                claude.reply("Found it: the hinge pin."),
+            ],
+        );
+        claude.session(
+            "-w-forest",
+            "22222222-bbbb",
+            &[testutil::prompt_in(
+                "Map the forest",
+                "2026-01-02T10:00:00Z",
+                "/w/forest",
+            )],
+        );
+        claude.touch("-w-paradis/11111111-aaaa.jsonl", 3_000);
+        claude.touch("-w-forest/22222222-bbbb.jsonl", 2_000);
+    }
+
+    #[test]
+    fn c_searches_text_after_a_pause_and_jumps_to_hits() {
+        let claude = Claude::new();
+        hinges(&claude);
+        let mut app = loaded(&claude);
+        typed(&mut app, "/c hinge pin");
+        // Nothing yet: it waits for typing to pause.
+        assert!(app.view.is_empty());
+        assert!(app.take_code_request(Instant::now()).is_none());
+        assert!(app.deadline().is_some());
+
+        run_code(&mut app);
+        assert_eq!(titles(&app), ["Why does the gate stick?"]);
+        let code = app.code.as_ref().unwrap();
+        assert_eq!((code.finished, code.hits()), (true, 2));
+        // The tool call and the reply hold the hits.
+        assert_eq!(app.rows(), [1, 2]);
+
+        // The transcript shows all output, and opens on the first hit.
+        app.wrap_transcript(60);
+        let rows: Vec<String> = app.wrapped_rows().iter().map(|r| app.row_text(r)).collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("hinge pin is"))
+            .unwrap();
+        assert_eq!(app.scroll, first - JUMP_CONTEXT);
+        app.focus = Focus::Transcript;
+        shift(&mut app, KeyCode::Down);
+        let second = rows.iter().position(|r| r.contains("Found it")).unwrap();
+        assert_eq!(app.scroll, second - JUMP_CONTEXT);
+        shift(&mut app, KeyCode::Down);
+        assert_eq!(app.scroll, second - JUMP_CONTEXT, "no hit past the last");
+        shift(&mut app, KeyCode::Up);
+        assert_eq!(app.scroll, first - JUMP_CONTEXT);
+
+        // More text: the search starts over, and stale results don't count.
+        let old = app.code.as_ref().unwrap().generation;
+        typed(&mut app, "s");
+        assert!(app.take_code_cancel());
+        app.update(Msg::Code(
+            old,
+            0,
+            Found {
+                hits: 1,
+                entries: vec![0],
+            },
+        ));
+        app.settle();
+        assert!(app.view.is_empty());
+        run_code(&mut app);
+        assert!(app.view.is_empty());
+        assert!(app.code.as_ref().unwrap().finished);
+
+        // Without `/c`, back to the fuzzy view.
+        for _ in 0.."/c hinge pins".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        assert!(app.code.is_none());
+        assert_eq!(app.view.len(), 2);
+    }
+
+    #[test]
+    fn c_searches_only_what_the_fuzzy_part_matched() {
+        let claude = Claude::new();
+        hinges(&claude);
+        let mut app = loaded(&claude);
+        typed(&mut app, "forest /c hinge");
+        run_code(&mut app);
+        assert!(app.view.is_empty());
+        assert_eq!(app.code.as_ref().unwrap().total, 1);
+    }
+
+    #[test]
+    fn h_keeps_sessions_that_worked_here() {
+        let claude = Claude::new();
+        hinges(&claude);
+        let mut app = loaded(&claude);
+        app.here = Some("/w/forest".into());
+        typed(&mut app, "/h");
+        assert_eq!(titles(&app), ["Map the forest"]);
+        assert!(app.is_here());
+        // Inside it counts; a sibling that shares the prefix doesn't.
+        app.here = Some("/w".into());
+        app.query.clear();
+        app.settle();
+        typed(&mut app, "/h");
+        assert_eq!(app.view.len(), 2);
+        app.here = Some("/w/fore".into());
+        app.query.clear();
+        app.settle();
+        typed(&mut app, "/h");
+        assert!(app.view.is_empty());
     }
 }

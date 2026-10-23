@@ -1,9 +1,11 @@
 mod app;
 mod clipboard;
 mod filter;
+mod grep;
 mod index;
 mod layout;
 mod plain;
+mod query;
 mod record;
 mod store;
 mod text;
@@ -20,7 +22,8 @@ use std::io::{self, IsTerminal, Stderr, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
@@ -217,9 +220,31 @@ fn print_matches(query: &str) -> Result<bool> {
             None => unreachable!("every file is loaded"),
         })
         .collect::<Result<Vec<_>>>()?;
-    let candidates: Vec<usize> = (0..sessions.len()).collect();
-    let mut hits = filter::par_matches(query.trim(), &sessions, &candidates);
+    let query = query::parse(query.trim());
+    let mut candidates: Vec<usize> = (0..sessions.len()).collect();
+    if query.here {
+        let dir = here()?;
+        candidates.retain(|&i| sessions[i].worked_in(&dir));
+    }
+    let mut hits = filter::par_matches(&query.fuzzy, &sessions, &candidates);
     filter::sort(&mut hits);
+    if let Some(pattern) = &query.code {
+        let files: Vec<SessionFile> = hits
+            .iter()
+            .map(|h| sessions[h.session].file.clone())
+            .collect();
+        let found = Mutex::new(vec![0; files.len()]);
+        grep::search(
+            &files,
+            pattern,
+            || true,
+            |i, f| {
+                found.lock().unwrap()[i] = f.map_or(0, |f| f.hits);
+            },
+        );
+        let mut found = found.into_inner().unwrap().into_iter();
+        hits.retain(|_| found.next().is_some_and(|n| n > 0));
+    }
     let mut out = io::BufWriter::new(io::stdout().lock());
     for hit in &hits {
         // A closed pipe (`| head`) just means nobody wants the rest.
@@ -264,6 +289,12 @@ fn print_session(id: &str, turn: Option<usize>) -> Result<bool> {
     Ok(true)
 }
 
+/// Where `/h` looks, from the current directory.
+fn here() -> Result<String> {
+    let dir = std::env::current_dir().context("can't tell the current directory")?;
+    Ok(store::here(&dir).to_string_lossy().into_owned())
+}
+
 fn browse() -> Result<Exit> {
     let (dir, shown) = projects()?;
     let files = discover(&dir, &shown)?;
@@ -271,6 +302,7 @@ fn browse() -> Result<Exit> {
         bail!("no sessions in {shown}");
     }
     let mut app = App::new(files.clone());
+    app.here = Some(here()?);
     app.no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     if !io::stderr().is_terminal() {
         bail!("needs a terminal (it draws on stderr, which isn't one)");
@@ -286,9 +318,16 @@ fn run(terminal: &mut Tui, app: &mut App, files: Vec<SessionFile>) -> Result<()>
     let (tx, rx) = mpsc::channel();
     worker::spawn_input(tx.clone());
     worker::spawn_index(files, tx.clone());
-    let transcripts = worker::spawn_transcripts(tx);
+    let transcripts = worker::spawn_transcripts(tx.clone());
+    let code = worker::CodeSearcher::new(tx);
     loop {
         app.settle();
+        if app.take_code_cancel() {
+            code.cancel();
+        }
+        if let Some(req) = app.take_code_request(Instant::now()) {
+            code.start(req);
+        }
         if let Some(request) = app.take_request() {
             transcripts.send(request)?;
         }
@@ -299,7 +338,15 @@ fn run(terminal: &mut Tui, app: &mut App, files: Vec<SessionFile>) -> Result<()>
             return Ok(());
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
-        app.update(rx.recv()?);
+        // Sleep until something happens, or until a pending search is due.
+        match app.deadline() {
+            Some(due) => match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(msg) => app.update(msg),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => bail!("event channel closed"),
+            },
+            None => app.update(rx.recv()?),
+        }
         // Apply everything that queued up during the draw before drawing again.
         while let Ok(msg) = rx.try_recv() {
             app.update(msg);

@@ -1,6 +1,8 @@
 //! Rendering: search bar on top, sessions | turns | transcript below, or on
 //! narrow terminals sessions | turns above the transcript.
 
+use std::ops::{Range, RangeInclusive};
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -8,11 +10,11 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use std::ops::RangeInclusive;
-
 use crate::app::{self, App, Focus};
+use crate::grep;
 use crate::index::Kind;
 use crate::record::PromptKind;
+use crate::store;
 use crate::text;
 use crate::time;
 use crate::transcript::{Item, Look};
@@ -21,9 +23,11 @@ const ACCENT: Color = Color::Cyan;
 
 /// The bottom row's key hints, most useful first. Those that don't fit the
 /// terminal's width are dropped from the end.
-const HINTS: [(&str, &str); 10] = [
+const HINTS: [(&str, &str); 12] = [
     ("↑↓", "move"),
     ("enter", "pick"),
+    ("/c", "search text"),
+    ("/h", "here"),
     ("tab", "pane"),
     ("esc", "clear/quit"),
     ("C-y", "copy id"),
@@ -133,6 +137,18 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
             format!("· reading {read}/{total} "),
             Style::new().fg(ACCENT),
         ));
+    }
+    if let (true, Some(here)) = (app.is_here(), &app.here) {
+        status.push_span(Span::raw(format!("· in {} ", store::tilde(here))));
+    }
+    if let Some(code) = &app.code {
+        let said = if code.finished {
+            let hits = code.hits();
+            format!("· {hits} {} ", if hits == 1 { "hit" } else { "hits" })
+        } else {
+            format!("· searching {}/{} ", code.searched, code.total)
+        };
+        status.push_span(Span::styled(said, Style::new().fg(ACCENT)));
     }
     if let Some(notice) = &app.notice {
         status.push_span(Span::styled(
@@ -298,7 +314,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .skip(app.scroll)
                 .take(inner.height as usize)
-                .map(|r| row_line(&t.items[r.item], app.visible(r), r.indent))
+                .map(|r| row_line(&t.items[r.item], app.visible(r), r.indent, app.pattern()))
                 .collect()
         }
     };
@@ -347,22 +363,31 @@ fn mark_text(buf: &mut Buffer, app: &App, inner: Rect) {
 }
 
 /// The bytes `shown` of a transcript line, with a diff line's changed words
-/// in reverse video, like `diff-highlight`.
-fn row_line(item: &Item, shown: std::ops::Range<usize>, indent: usize) -> Line<'_> {
+/// in reverse video, like `diff-highlight`, and `/c` matches on top.
+fn row_line<'a>(
+    item: &'a Item,
+    shown: Range<usize>,
+    indent: usize,
+    pattern: Option<&str>,
+) -> Line<'a> {
     let base = look_style(item.look);
+    let found = pattern.map_or_else(Vec::new, |p| grep::find(&item.text, p));
     let mut spans = vec![Span::raw(" ".repeat(indent))];
     let mut cuts: Vec<usize> = item
         .emph
         .iter()
+        .chain(&found)
         .flat_map(|r| [r.start, r.end])
         .filter(|&at| shown.contains(&at))
         .chain([shown.start, shown.end])
         .collect();
     cuts.sort_unstable();
     cuts.dedup();
+    let within = |ranges: &[Range<usize>], at: usize| ranges.iter().any(|r| r.contains(&at));
     for w in cuts.windows(2) {
-        let changed = item.emph.iter().any(|r| r.contains(&w[0]));
-        let style = if changed {
+        let style = if within(&found, w[0]) {
+            code_match()
+        } else if within(&item.emph, w[0]) {
             base.add_modifier(Modifier::REVERSED)
         } else {
             base
@@ -390,6 +415,14 @@ fn look_style(look: Look) -> Style {
         Look::Agent => Style::new().fg(Color::Blue),
         Look::Thinking => Style::new().dark_gray().italic(),
     }
+}
+
+/// A `/c` match: it has to stand out from everything else on the line.
+fn code_match() -> Style {
+    Style::new()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn matched(style: Style) -> Style {
@@ -599,5 +632,36 @@ mod tests {
         assert!(reversed(&mut app, x + 2, top + 1));
         assert!(!reversed(&mut app, x + 1, top + 3), "not the indent");
         assert!(!reversed(&mut app, x + 30, top + 1), "nor past the text");
+    }
+
+    #[test]
+    fn c_matches_stand_out_and_the_status_counts_them() {
+        let claude = Claude::new();
+        three(&claude);
+        let mut app = loaded(&claude);
+        typed(&mut app, "/c hinges");
+        crate::app::tests::run_code(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("1/3 sessions · 1 hit"), "{screen}");
+        let (x, y) = (0..buf.area.height)
+            .find_map(|y| {
+                let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                let at = row.windows(6).position(|w| w.concat() == "hinges")?;
+                // The transcript's copy, not the turns column's.
+                (at as u16 > app.panes[2].x).then_some((at as u16, y))
+            })
+            .unwrap();
+        assert_eq!(buf[(x, y)].bg, Color::Yellow);
+        assert_eq!(buf[(x - 1, y)].bg, Color::Reset);
     }
 }
