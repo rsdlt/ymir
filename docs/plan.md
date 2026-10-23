@@ -380,9 +380,12 @@ Each step ends in a release with a CHANGELOG entry; commit messages carry the nu
 
 ## Name
 
-The crate is **`ymir-sessions`** (`ymir` is taken on crates.io); the binary is `ymir`, as
-`levi-git` ships `levi`. Free as of 2026-10-22, as are `ymir-paths`, `ymir-cc`, `ymir-tui`.
+The crate is **`ymir-code`** (`ymir` is taken on crates.io); the binary is `ymir`, as
+`levi-git` ships `levi`. Free as of 2026-10-22: it names the domain the way `levi-git` does,
+since the sessions are Claude Code's.
 
+- Superseded: `ymir-sessions`, the first proposal (descriptive, but longer to type for
+  `cargo install`).
 - Rejected: `ymir-paths` (thematic, but on crates.io it reads like a filesystem-path crate),
   `ymir-cc` (cryptic), `ymir-tui` (says how, not what).
 
