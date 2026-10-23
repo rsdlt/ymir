@@ -1,8 +1,9 @@
 //! Text from sessions, made safe and fitted to the screen.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Tool output is full of terminal escapes (colors, cursor moves), and a
 /// session can hold any bytes at all. Drawn as they are, they'd act on the
@@ -56,8 +57,9 @@ pub fn clean(text: &str) -> Cow<'_, str> {
 }
 
 /// Splits `text` into rows of at most `width` columns, breaking after
-/// whitespace where it can and inside a word where it must.
-pub fn wrap(text: &str, width: usize) -> Vec<&str> {
+/// whitespace where it can and inside a word where it must. Each row is a
+/// byte range of `text`.
+pub fn wrap(text: &str, width: usize) -> Vec<Range<usize>> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let (mut start, mut col) = (0, 0);
@@ -70,7 +72,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<&str> {
                 Some((at, at_col)) if at > start && at < i => (at, col - at_col),
                 _ => (i, 0),
             };
-            rows.push(&text[start..cut]);
+            rows.push(start..cut);
             (start, col, gap) = (cut, carried, None);
         }
         col += w;
@@ -78,8 +80,30 @@ pub fn wrap(text: &str, width: usize) -> Vec<&str> {
             gap = Some((i + c.len_utf8(), col));
         }
     }
-    rows.push(&text[start..]);
+    rows.push(start..text.len());
     rows
+}
+
+/// Terminal columns `text` takes up.
+pub fn columns(text: &str) -> usize {
+    text.width()
+}
+
+/// The bytes of `text` whose chars start at display columns `from..to`.
+pub fn column_range(text: &str, from: usize, to: usize) -> Range<usize> {
+    let (mut start, mut end) = (None, text.len());
+    let mut col = 0;
+    for (i, c) in text.char_indices() {
+        if col >= to {
+            end = i;
+            break;
+        }
+        if start.is_none() && col >= from {
+            start = Some(i);
+        }
+        col += c.width().unwrap_or(0);
+    }
+    start.unwrap_or(end).min(end)..end
 }
 
 #[cfg(test)]
@@ -100,6 +124,13 @@ mod tests {
         assert_eq!(clean("\x1b(Bplain\x1b"), "plain");
     }
 
+    fn wrap(text: &str, width: usize) -> Vec<&str> {
+        super::wrap(text, width)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect()
+    }
+
     #[test]
     fn wraps_at_spaces() {
         assert_eq!(wrap("the wall is tall", 8), ["the ", "wall is ", "tall"]);
@@ -117,6 +148,19 @@ mod tests {
     fn wide_characters_count_twice() {
         assert_eq!(wrap("巨人巨人巨", 4), ["巨人", "巨人", "巨"]);
         assert_eq!(wrap("ab巨", 3), ["ab", "巨"]);
+    }
+
+    #[test]
+    fn column_ranges() {
+        let cut = |text, from, to| &text[column_range(text, from, to)];
+        assert_eq!(cut("+let x = 1;", 4, 7), " x ");
+        assert_eq!(cut("abc", 5, 9), "");
+        assert_eq!(
+            cut("巨人巨", 1, 4),
+            "人",
+            "a wide char starts where it starts"
+        );
+        assert_eq!(cut("abc", 1, usize::MAX), "bc");
     }
 
     #[test]

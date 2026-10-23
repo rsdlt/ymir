@@ -10,6 +10,7 @@ mod text;
 mod time;
 mod transcript;
 mod ui;
+mod words;
 mod worker;
 
 #[cfg(test)]

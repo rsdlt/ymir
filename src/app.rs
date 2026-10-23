@@ -3,6 +3,7 @@
 //! tests play both parts.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,8 @@ use crate::transcript::{Look, Transcript};
 const TRANSCRIPT_CACHE: usize = 8;
 /// Lines one turn of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
+/// Columns one sideways scroll of a diff moves, by key or wheel.
+const SIDE_STEP: isize = 8;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub enum Msg {
@@ -67,16 +70,21 @@ pub enum Exit {
 pub struct Row {
     /// The transcript line it comes from.
     pub item: usize,
-    pub text: String,
+    /// The part of the line on this row, as a byte range of its text. A
+    /// diff line is never wrapped, so it's all of it.
+    pub span: Range<usize>,
+    pub indent: usize,
 }
 
 /// The selected transcript, wrapped to the pane's width.
 struct Wrapped {
-    id: String,
+    t: Arc<Transcript>,
     width: usize,
     rows: Vec<Row>,
     /// The first row of each transcript line.
     starts: Vec<usize>,
+    /// Columns the widest diff line needs, indent included.
+    wide: usize,
 }
 
 pub struct App {
@@ -103,6 +111,8 @@ pub struct App {
     wrapped: Option<Wrapped>,
     /// First transcript row on screen.
     pub scroll: usize,
+    /// How far diffs are scrolled sideways, in columns.
+    pub column: usize,
     /// The entry to bring to the top once the transcript is in and wrapped.
     follow: Option<usize>,
     pub transcript_height: usize,
@@ -139,6 +149,7 @@ impl App {
             failed: None,
             wrapped: None,
             scroll: 0,
+            column: 0,
             follow: None,
             transcript_height: 0,
             exit: None,
@@ -305,9 +316,9 @@ impl App {
         let stale = self
             .wrapped
             .as_ref()
-            .is_none_or(|w| w.id != t.id || w.width != width);
+            .is_none_or(|w| w.t.id != t.id || w.width != width);
         if stale {
-            let same = self.wrapped.as_ref().is_some_and(|w| w.id == t.id);
+            let same = self.wrapped.as_ref().is_some_and(|w| w.t.id == t.id);
             // Keep the line on top when only the width changed.
             let top = self
                 .wrapped
@@ -316,6 +327,9 @@ impl App {
                 .and_then(|w| w.rows.get(self.scroll))
                 .map(|r| r.item);
             self.wrapped = Some(wrap(&t, width));
+            if !same {
+                self.column = 0;
+            }
             if let Some(item) = top {
                 self.scroll = self.wrapped.as_ref().unwrap().starts[item];
             } else if !same && self.follow.is_none() {
@@ -327,11 +341,36 @@ impl App {
             self.scroll = t.entries.get(entry).map_or(0, |&item| wrapped.starts[item]);
         }
         self.scroll = self.scroll.min(wrapped.rows.len().saturating_sub(1));
+        self.column = self.column.min(wrapped.wide.saturating_sub(width));
     }
 
     /// The transcript's rows, as `wrap_transcript` last fitted them.
     pub fn wrapped_rows(&self) -> &[Row] {
         self.wrapped.as_ref().map_or(&[], |w| &w.rows)
+    }
+
+    /// The bytes of a row's line that are on screen: the row's part of it,
+    /// or for a diff line, what the sideways scroll leaves in view.
+    pub fn visible(&self, row: &Row) -> Range<usize> {
+        let Some(w) = &self.wrapped else {
+            return 0..0;
+        };
+        let item = &w.t.items[row.item];
+        if !item.look.is_diff() {
+            return row.span.clone();
+        }
+        let room = w.width.saturating_sub(row.indent);
+        text::column_range(&item.text, self.column, self.column + room)
+    }
+
+    /// A row as it's shown, indent included.
+    #[cfg(test)]
+    pub fn row_text(&self, row: &Row) -> String {
+        let Some(w) = &self.wrapped else {
+            return String::new();
+        };
+        let text = &w.t.items[row.item].text[self.visible(row)];
+        format!("{}{text}", " ".repeat(row.indent))
     }
 
     pub fn take_clipboard(&mut self) -> Option<String> {
@@ -351,6 +390,8 @@ impl App {
             KeyCode::Char('u') if ctrl => self.scroll_by(-half),
             KeyCode::Down if shift => self.jump_turn(true),
             KeyCode::Up if shift => self.jump_turn(false),
+            KeyCode::Right if shift => self.scroll_sideways(SIDE_STEP),
+            KeyCode::Left if shift => self.scroll_sideways(-SIDE_STEP),
             KeyCode::Down => self.move_in(self.focus, 1),
             KeyCode::Up => self.move_in(self.focus, -1),
             KeyCode::PageDown => self.scroll_by(page),
@@ -409,6 +450,16 @@ impl App {
         self.scroll = step(self.scroll, delta, rows);
     }
 
+    /// Moves diffs sideways, no further than it takes to show the end of the
+    /// widest one.
+    fn scroll_sideways(&mut self, delta: isize) {
+        let last = self
+            .wrapped
+            .as_ref()
+            .map_or(0, |w| w.wide.saturating_sub(w.width));
+        self.column = step(self.column, delta, last + 1);
+    }
+
     /// Puts the next (or previous) prompt of yours at the top.
     fn jump_turn(&mut self, forward: bool) {
         let (Ok(t), Some(w)) = (self.transcript().cloned(), self.wrapped.as_ref()) else {
@@ -451,7 +502,14 @@ impl App {
             return;
         };
         let pane = [Focus::Sessions, Focus::Turns, Focus::Transcript][i];
+        let transcript = pane == Focus::Transcript;
+        // Some terminals send Shift+wheel as a vertical scroll with Shift held.
+        let sideways = mouse.modifiers.contains(KeyModifiers::SHIFT);
         match mouse.kind {
+            MouseEventKind::ScrollRight if transcript => self.scroll_sideways(SIDE_STEP),
+            MouseEventKind::ScrollLeft if transcript => self.scroll_sideways(-SIDE_STEP),
+            MouseEventKind::ScrollDown if transcript && sideways => self.scroll_sideways(SIDE_STEP),
+            MouseEventKind::ScrollUp if transcript && sideways => self.scroll_sideways(-SIDE_STEP),
             MouseEventKind::ScrollDown if pane == Focus::Transcript => self.scroll_by(WHEEL_LINES),
             MouseEventKind::ScrollUp if pane == Focus::Transcript => self.scroll_by(-WHEEL_LINES),
             MouseEventKind::ScrollDown => self.move_in(pane, 1),
@@ -508,26 +566,37 @@ pub fn is_turn(session: &Session, entry: usize) -> bool {
         .is_some_and(|e| e.depth == 0 && matches!(e.kind, Kind::Prompt(_)))
 }
 
-fn wrap(t: &Transcript, width: usize) -> Wrapped {
+fn wrap(t: &Arc<Transcript>, width: usize) -> Wrapped {
     let mut rows = Vec::new();
     let mut starts = Vec::with_capacity(t.items.len());
+    let mut wide = 0;
     for (i, item) in t.items.iter().enumerate() {
         starts.push(rows.len());
         // Keep at least a few columns for the text, however deep it sits.
         let indent = item.indent.min(width.saturating_sub(8));
-        let pad = " ".repeat(indent);
-        for piece in text::wrap(&item.text, width - indent) {
+        if item.look.is_diff() {
+            wide = wide.max(indent + text::columns(&item.text));
             rows.push(Row {
                 item: i,
-                text: format!("{pad}{piece}"),
+                span: 0..item.text.len(),
+                indent,
+            });
+            continue;
+        }
+        for span in text::wrap(&item.text, width - indent) {
+            rows.push(Row {
+                item: i,
+                span,
+                indent,
             });
         }
     }
     Wrapped {
-        id: t.id.clone(),
+        t: t.clone(),
         width,
         rows,
         starts,
+        wide,
     }
 }
 
@@ -677,7 +746,7 @@ pub mod tests {
         let mut app = loaded(&claude);
         assert_eq!(app.rows(), [0, 3]);
         app.wrap_transcript(60);
-        let rows: Vec<String> = app.wrapped_rows().iter().map(|r| r.text.clone()).collect();
+        let rows: Vec<String> = app.wrapped_rows().iter().map(|r| app.row_text(r)).collect();
         assert!(rows[0].starts_with("❯ you"));
         assert_eq!(app.scroll, 0);
         app.focus = Focus::Turns;
@@ -738,8 +807,75 @@ pub mod tests {
         app.wrap_transcript(14);
         let rows = app.wrapped_rows().to_vec();
         // "  Reinforce the gate" in 12 columns: the indent repeats.
-        assert_eq!(rows[1].text, "  Reinforce ");
-        assert_eq!(rows[2].text, "  the gate");
+        assert_eq!(app.row_text(&rows[1]), "  Reinforce ");
+        assert_eq!(app.row_text(&rows[2]), "  the gate");
         assert_eq!(rows[1].item, rows[2].item);
+    }
+
+    fn shift(app: &mut App, code: KeyCode) {
+        app.update(Msg::Input(Event::Key(KeyEvent::new(
+            code,
+            KeyModifiers::SHIFT,
+        ))));
+    }
+
+    /// A session whose one edit adds a line 51 columns wide.
+    pub fn wide(claude: &Claude) {
+        let long = format!("+{}", "x".repeat(50));
+        claude.session(
+            "-w-wall",
+            "44444444-dddd",
+            &[
+                claude.prompt("Widen the wall to the sea", "2026-01-04T10:00:00Z"),
+                claude.tool("t1", "Edit", json!({"file_path": "/w/wall/a.rs"})),
+                testutil::result(
+                    "t1",
+                    "ok",
+                    json!({"filePath": "/w/wall/a.rs", "structuredPatch": [{"oldStart": 1,
+                        "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-pin(3);", "+pin(5);", long]}]}),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn diffs_scroll_sideways_while_prose_wraps() {
+        let claude = Claude::new();
+        three(&claude);
+        // The newest, so it's selected.
+        wide(&claude);
+        let mut app = loaded(&claude);
+        app.wrap_transcript(20);
+        let rows = app.wrapped_rows().to_vec();
+        let shown = |app: &App| -> Vec<String> { rows.iter().map(|r| app.row_text(r)).collect() };
+        let before = shown(&app);
+        let x = format!("    +{}", "x".repeat(15));
+        assert!(before.contains(&x), "{before:?}");
+        // The diff line stays one row; the prompt wraps.
+        assert_eq!(before.iter().filter(|r| r.contains('x')).count(), 1);
+        assert_eq!(before[1..3], ["  Widen the wall to ", "  the sea"]);
+
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.column, 8);
+        let after = shown(&app);
+        assert!(
+            after.contains(&format!("    {}", "x".repeat(16))),
+            "{after:?}"
+        );
+        assert_eq!(after[1..3], before[1..3], "prose doesn't move");
+
+        // No further than the end of the widest line: 4 + 51 columns, in 20.
+        for _ in 0..10 {
+            shift(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.column, 35);
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(app.column, 27);
+
+        // Another session starts at the left edge.
+        app.focus = Focus::Sessions;
+        key(&mut app, KeyCode::Down);
+        app.wrap_transcript(20);
+        assert_eq!(app.column, 0);
     }
 }

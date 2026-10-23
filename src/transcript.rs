@@ -4,11 +4,13 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::ops::Range;
 
 use crate::index;
 use crate::record::{Detail, Edit, Output, Piece, PromptKind};
 use crate::store::{self, SessionFile};
 use crate::time;
+use crate::words;
 
 /// How a line looks. The TUI gives each a style; plain text ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,17 @@ pub enum Look {
     Agent,
 }
 
+impl Look {
+    /// Lines of a diff, which keep their columns: they don't wrap, and
+    /// scroll sideways instead.
+    pub fn is_diff(self) -> bool {
+        matches!(
+            self,
+            Look::Hunk | Look::Added | Look::Removed | Look::Context
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub look: Look,
@@ -46,6 +59,8 @@ pub struct Item {
     pub turn: usize,
     /// The search entry this line starts, numbered as the index numbers them.
     pub entry: Option<usize>,
+    /// Changed words of a diff line, as byte ranges of `text`.
+    pub emph: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +128,7 @@ impl Builder {
                 indent,
                 turn: self.turn,
                 entry: entry.take(),
+                emph: Vec::new(),
             });
         }
     }
@@ -282,6 +298,7 @@ impl Builder {
             // A new file's content is the whole file; its size says enough.
             return;
         }
+        let start = self.parts.last().map_or(0, Vec::len);
         let mut budget = self.limits.diff;
         let total: usize = edit.hunks.iter().map(|h| h.lines.len() + 1).sum();
         for hunk in &edit.hunks {
@@ -307,6 +324,9 @@ impl Builder {
                 self.push(look, &line.replace(['\n', '\r'], " "), indent, None);
                 budget -= 1;
             }
+        }
+        if let Some(part) = self.parts.last_mut() {
+            words::mark(&mut part[start..]);
         }
         let shown = self.limits.diff.min(total);
         if total > shown {
@@ -579,13 +599,18 @@ mod real {
         let mut files = store::discover(&projects).unwrap();
         files.sort_by_key(|f| f.size);
         let mut times = Vec::new();
-        let mut lines = 0;
+        let (mut lines, mut diff, mut marked, mut widest) = (0, 0, 0, 0);
         for file in &files {
             let s = Session::load(file.clone()).unwrap();
             let start = Instant::now();
             let t = load(file, Limits::SCREEN).unwrap();
             times.push((start.elapsed(), file.size));
             lines += t.items.len();
+            for item in t.items.iter().filter(|i| i.look.is_diff()) {
+                diff += 1;
+                marked += usize::from(!item.emph.is_empty());
+                widest = widest.max(crate::text::columns(&item.text));
+            }
             assert_eq!(t.entries.len(), s.entries.len(), "{}", file.id);
             assert_eq!(t.turns, s.turns, "{}", file.id);
         }
@@ -601,5 +626,6 @@ mod real {
             largest.1 as f64 / 1e6,
             slowest.0
         );
+        println!("{diff} diff lines, {marked} with changed words; widest {widest} columns");
     }
 }

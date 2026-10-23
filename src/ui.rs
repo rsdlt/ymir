@@ -12,7 +12,7 @@ use crate::app::{self, App, Focus};
 use crate::index::Kind;
 use crate::record::PromptKind;
 use crate::time;
-use crate::transcript::Look;
+use crate::transcript::{Item, Look};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -270,28 +270,58 @@ fn draw_turns(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Transcript;
-    let title = match app.session() {
-        Some(s) if s.ready => format!(" {} · {} ", app::short(&s.file.id), s.project),
-        Some(s) => format!(" {} ", app::short(&s.file.id)),
-        None => " transcript ".into(),
-    };
-    let block = pane(title, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = Block::bordered().inner(area);
     app.transcript_height = inner.height as usize;
-    let lines: Vec<Line> = match app.transcript().cloned() {
-        Err(reason) => vec![Line::styled(reason, Style::new().dark_gray())],
+    let transcript = app.transcript().cloned();
+    let lines: Vec<Line> = match &transcript {
+        Err(reason) => vec![Line::styled(reason.as_str(), Style::new().dark_gray())],
         Ok(t) => {
             app.wrap_transcript(inner.width as usize);
             app.wrapped_rows()
                 .iter()
                 .skip(app.scroll)
                 .take(inner.height as usize)
-                .map(|r| Line::styled(r.text.clone(), look_style(t.items[r.item].look)))
+                .map(|r| row_line(&t.items[r.item], app.visible(r), r.indent))
                 .collect()
         }
     };
-    frame.render_widget(Paragraph::new(lines), inner);
+    let mut title = match app.session() {
+        Some(s) if s.ready => format!(" {} · {} ", app::short(&s.file.id), s.project),
+        Some(s) => format!(" {} ", app::short(&s.file.id)),
+        None => " transcript ".into(),
+    };
+    if app.column > 0 {
+        // Says the diffs are shifted, and by how much.
+        title.push_str(&format!("· col {} ", app.column + 1));
+    }
+    let block = pane(title, focused);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The bytes `shown` of a transcript line, with a diff line's changed words
+/// in reverse video, like `diff-highlight`.
+fn row_line(item: &Item, shown: std::ops::Range<usize>, indent: usize) -> Line<'_> {
+    let base = look_style(item.look);
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    let mut cuts: Vec<usize> = item
+        .emph
+        .iter()
+        .flat_map(|r| [r.start, r.end])
+        .filter(|&at| shown.contains(&at))
+        .chain([shown.start, shown.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    for w in cuts.windows(2) {
+        let changed = item.emph.iter().any(|r| r.contains(&w[0]));
+        let style = if changed {
+            base.add_modifier(Modifier::REVERSED)
+        } else {
+            base
+        };
+        spans.push(Span::styled(&item.text[w[0]..w[1]], style));
+    }
+    Line::from(spans)
 }
 
 fn look_style(look: Look) -> Style {
@@ -352,7 +382,7 @@ fn spans_owned(spans: Vec<Span<'_>>) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{key, loaded, three, typed};
+    use crate::app::tests::{key, loaded, three, typed, wide};
     use crate::testutil::Claude;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -410,5 +440,35 @@ mod tests {
             render_at(&mut app, w, h);
             key(&mut app, KeyCode::Down);
         }
+    }
+
+    #[test]
+    fn changed_words_are_marked() {
+        let claude = Claude::new();
+        wide(&claude);
+        let mut app = loaded(&claude);
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let reversed = |want: &str| -> Vec<bool> {
+            let y = (0..buf.area.height)
+                .find(|&y| {
+                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    row.contains(want)
+                })
+                .unwrap();
+            let row: Vec<_> = (0..buf.area.width).map(|x| &buf[(x, y)]).collect();
+            let at = row
+                .windows(want.len())
+                .position(|w| w.iter().map(|c| c.symbol()).collect::<String>() == want)
+                .unwrap();
+            row[at..at + want.len()]
+                .iter()
+                .map(|c| c.modifier.contains(Modifier::REVERSED))
+                .collect()
+        };
+        let only_the_digit = [false, false, false, false, false, true, false, false];
+        assert_eq!(reversed("-pin(3);"), only_the_digit);
+        assert_eq!(reversed("+pin(5);"), only_the_digit);
     }
 }
