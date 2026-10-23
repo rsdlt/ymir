@@ -43,6 +43,8 @@ even a line. ymir makes no network calls; keep it that way.
 2. Bump `version` in `Cargo.toml` following [SemVer](https://semver.org/).
 3. Commit "Release x.y.z" and tag it `vx.y.z`.
 4. Push the commit and the tag, then run `cargo publish`.
+5. Run `cargo clean -p ymir-code`. Publishing builds the packaged copy, and cargo can keep
+   pointing at that build afterwards, so a later local build may run a stale binary.
 
 ## Design
 

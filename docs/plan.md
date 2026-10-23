@@ -249,7 +249,14 @@ Which commits a session produced, so either can lead to the other.
 - `❯ you · 20:31` and the prompt, in full. `● claude` and the reply text, in full, with code
   fences kept as they are (no Markdown rendering).
 - Tool calls: `▸ Bash cargo test --locked`, then the result's first 6 lines, dimmed, and
-  `… 120 more lines`. Errors in red. `C-e` expands every result in the session and back.
+  `… 120 more lines`. Errors in red. `C-e` shows every result in full and back: a mode
+  that stays on from session to session, since what you want expanded in one you want in
+  the next. Superseded: expanding the selected session only.
+- Expanded transcripts are read again with no limits, not kept beside the cut ones, so the
+  usual browsing costs no more memory. Measured in 0.2.0: the largest session (169.5 MB)
+  opens expanded in 47 ms (36,820 lines, 1.7 MB of text), the one with the most output
+  (118.8 MB) in 72 ms (84,651 lines, 4.8 MB). Rejected: one load with every line, the cut
+  ones hidden (memory for output nobody asked to see).
 - Edits: Edit, Write (`update`) and shell edits (`bashEditDiff`) draw their hunks the way
   levi draws a diff: `+`/`-` bars, green and red, changed words marked (levi's `words.rs`).
   A Write that creates a file shows its line count, not its content (`C-e` shows it).
@@ -257,7 +264,9 @@ Which commits a session produced, so either can lead to the other.
   indented one level, collapsed to its prompt, its tool calls and its last reply.
 - Compaction: a divider. Images: `[image]`.
 - Lines wrap (prose, unlike code, is unreadable scrolled sideways); diffs don't, and scroll
-  sideways as in levi. (0.1.0 wraps diffs too; sideways scrolling comes with 0.2.0.)
+  sideways as in levi, all together, by one column offset; prose doesn't move. (Since 0.2.0;
+  0.1.0 wrapped diffs too.) The widest diff line in my sessions is 32,997 columns, a
+  minified file: wrapped, it filled screens.
 - A session loads in full on a worker when it's selected (the index keeps only what search
   needs) and stays in a small LRU. Stale loads are dropped, as levi drops stale diffs.
 
@@ -273,11 +282,11 @@ Which commits a session produced, so either can lead to the other.
 | `S-←/S-→` | scroll a diff sideways |
 | `Enter` | print the session id and quit |
 | `C-y` | copy the session id |
-| `C-e` | expand or collapse tool results (0.2.0) |
+| `C-e` | all tool output, or the first lines again |
 | `C-w` | delete the query's last word |
 | `Esc` | clear the query, or quit |
 | `C-c` | quit |
-| mouse | as levi: click, wheel, drag a seam to resize; drag to copy comes with 0.2.0 |
+| mouse | as levi: click, wheel, drag a seam to resize, drag over text to copy it |
 
 ## CLI behaviour
 
@@ -425,7 +434,8 @@ tests/
 
 In 0.1.0, also `text.rs` (cleaning and wrapping session text), `clipboard.rs` and
 `layout.rs` (both from levi), and `tests/readonly.rs` (the source check). Not yet:
-`query.rs`, `grep.rs`, `git.rs`, `focus.rs`, `words.rs`, which come with their features.
+`query.rs`, `grep.rs`, `git.rs`, `focus.rs`, which come with their features. `words.rs`
+came with 0.2.0.
 
 ## Build order
 
@@ -438,7 +448,10 @@ Each step ends in a release with a CHANGELOG entry; commit messages carry the nu
    index, refilter, memory. **Done**, with diffs of edits already shown, in plain colors:
    `--show` needed them.
 2. **0.2.0** — changed words in diffs, diffs scrolling sideways instead of wrapping, `C-e`,
-   drag to copy.
+   drag to copy. **Done.** Over my 70 sessions, 11,244 of 157,503 diff lines get changed
+   words marked; marking costs 2 ms on the largest session (46 ms to open, from 44). Drag
+   to copy copies sessions as `--filter` lines, turns as their lines, and transcript text
+   with wrapped lines joined back up.
 3. **0.3.0** — `/c` literal search with hit jumps; `/h`.
 4. **0.4.0** — follow live sessions (stat poll, offsets), keeping the selection.
 5. **0.5.0** — git links, measured first against my 656 commit calls; `/g`, sha search.

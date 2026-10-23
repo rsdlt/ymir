@@ -58,12 +58,15 @@ Keys:
   Tab/S-Tab  ←/→      switch pane: sessions, turns, transcript
   PgUp/PgDn  C-u/C-d  scroll the transcript
   S-↑/S-↓             previous/next prompt in the transcript
+  S-←/S-→             scroll diffs sideways
+  C-e                 all tool output, or the first lines again
   Enter               print the session id and quit:  claude --resume $(ymir)
   C-y                 copy the session id
   C-w                 delete the last word of the query
   Esc                 clear the query, or quit
   C-c                 quit
   click, wheel        select, scroll
+  drag over text      copy it
   drag a border       resize the panes beside it (double-click: back to the
                       defaults)
 

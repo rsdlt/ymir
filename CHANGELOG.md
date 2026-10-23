@@ -7,6 +7,21 @@ the search syntax, what `--filter` and `--show` print, and the exit codes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-23
+
+### Added
+
+- Changed words in diffs are marked, as levi marks them.
+- `C-e` shows all of every tool's output, whole diffs, and the content of files a call
+  created; `C-e` again goes back to the first lines. It stays on from session to session.
+- Drag over a pane to copy: the transcript copies the text under the drag, with wrapped
+  lines joined back up; sessions copy as `--filter` prints them; turns copy their lines.
+
+### Changed
+
+- Diff lines no longer wrap. They keep their columns and scroll sideways with `S-←`/`S-→`
+  or a sideways wheel; the transcript's title says how far.
+
 ## [0.1.0] - 2026-10-22
 
 First release.
@@ -35,5 +50,6 @@ First release.
 - CI: tests on Linux and macOS, rustfmt, clippy, the minimum Rust version (1.88), and
   `cargo deny`.
 
-[Unreleased]: https://github.com/rsdlt/ymir/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rsdlt/ymir/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rsdlt/ymir/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rsdlt/ymir/releases/tag/v0.1.0

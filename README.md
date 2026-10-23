@@ -33,7 +33,7 @@ On my machine, an Apple M4 Pro (12 cores), over 126 session files and 545 MB, th
 | Read and index every session | **0.06 s** (0.27 s from a cold disk cache) |
 | First screen | 15–45 ms |
 | Refilter as you type | 9–14 ms per key, over all 17,700 entries |
-| Open the largest session | 42 ms |
+| Open the largest session | 46 ms |
 | Memory, everything indexed | 38 MB |
 
 ymir skips what isn't conversation before parsing it (the API requests Claude Code logs are
@@ -54,6 +54,10 @@ Run `ymir`. Sessions are listed newest first, with their project and title. The 
 column lists your prompts in the selected session, one per turn, and the transcript on the
 right follows the one you pick.
 
+Tool calls show the first lines of their output; `C-e` shows all of it, in every session,
+until you press it again. Edits show as diffs, with the words that changed marked. Prose
+wraps; diffs keep their columns and scroll sideways.
+
 `Enter` prints the selected session's id and quits, so ymir works as a picker. From the
 session's project directory:
 
@@ -68,12 +72,15 @@ claude --resume $(ymir)
 | `Tab` | switch pane: sessions, turns, transcript |
 | `PgUp` `PgDn` | scroll the transcript |
 | `S-↑` `S-↓` | previous or next prompt in the transcript |
+| `S-←` `S-→` | scroll diffs sideways |
+| `C-e` | all tool output, or the first lines again |
 | `Enter` | print the session id and quit |
 | `C-y` | copy the session id |
 | `Esc` | clear the search, or quit |
 
 The mouse works too: click to select, scroll with the wheel, drag a border to resize the
-panes. `ymir --help` lists every key. Set `NO_COLOR` for plain black and white.
+panes. Drag over text to copy it: the transcript copies what you selected, the sessions
+column copies sessions as `--filter` prints them. `ymir --help` lists every key. Set `NO_COLOR` for plain black and white.
 
 ## Search
 
@@ -158,7 +165,7 @@ followed.
 - **Forgiving.** Claude Code's session format isn't a public contract and changes between
   versions. ymir reads only the fields it needs, and skips what it doesn't know rather than
   failing: a new record type, a renamed field, a line still being written.
-- **Small.** About 3,200 lines of Rust and a 1.8 MB binary.
+- **Small.** About 3,300 lines of Rust and a 1.8 MB binary.
 
 Sessions are read from `~/.claude/projects`, or from `$CLAUDE_CONFIG_DIR/projects` when
 that's set.
