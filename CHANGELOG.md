@@ -7,6 +7,19 @@ the search syntax, what `--filter` and `--show` print, and the exit codes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- `/c text` searches every session literally, with smart case, tool output and thinking
+  included; the fuzzy words before it pick which sessions to search. It starts once typing
+  pauses and streams sessions in. The transcript opens on the first hit, with every hit
+  marked, and `S-↑`/`S-↓` step through them.
+- `/h` keeps only the sessions that worked in the current directory, or its repository.
+- `/c` and `/h` work in `--filter` too.
+- With `C-e`, the transcript also shows Claude's thinking, where the session kept its text,
+  and multi-line commands whole.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
@@ -50,6 +63,7 @@ First release.
 - CI: tests on Linux and macOS, rustfmt, clippy, the minimum Rust version (1.88), and
   `cargo deny`.
 
-[Unreleased]: https://github.com/rsdlt/ymir/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rsdlt/ymir/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rsdlt/ymir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rsdlt/ymir/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rsdlt/ymir/releases/tag/v0.1.0

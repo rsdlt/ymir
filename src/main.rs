@@ -56,11 +56,16 @@ in them: your prompts, Claude's replies, tool calls and the files they touched.
 fzf syntax: 'exact  ^prefix  suffix$  !negate  (space-separated terms all match)
 A session id prefix (4+ characters) finds that session.
 
+  /c text   search for text literally, tool output and thinking included:
+            everything after /c, spaces too, with smart case. The words
+            before it pick which sessions to search.
+  /h        only sessions that worked in this directory or its repository
+
 Keys:
   ↑/↓  C-p/C-n        move in the focused pane
   Tab/S-Tab  ←/→      switch pane: sessions, turns, transcript
   PgUp/PgDn  C-u/C-d  scroll the transcript
-  S-↑/S-↓             previous/next prompt in the transcript
+  S-↑/S-↓             previous/next prompt in the transcript, or /c hit
   S-←/S-→             scroll diffs sideways
   C-e                 all tool output, or the first lines again
   Enter               print the session id and quit:  claude --resume $(ymir)

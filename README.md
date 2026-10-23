@@ -71,7 +71,7 @@ claude --resume $(ymir)
 | `↑` `↓` | move |
 | `Tab` | switch pane: sessions, turns, transcript |
 | `PgUp` `PgDn` | scroll the transcript |
-| `S-↑` `S-↓` | previous or next prompt in the transcript |
+| `S-↑` `S-↓` | previous or next prompt in the transcript; with `/c`, previous or next hit |
 | `S-←` `S-→` | scroll diffs sideways |
 | `C-e` | all tool output, or the first lines again |
 | `Enter` | print the session id and quit |
@@ -95,7 +95,16 @@ together, so `focus` finds the replies that say it rather than every paragraph w
 an o and a c in it; typos still match. Paths are fully fuzzy: `scbtn` finds
 `src/components/Button.tsx`. Four or more characters of a session id find that session.
 
-Tool output isn't searched yet; that comes with `/c`, a literal search over everything.
+Fuzzy search leaves out tool output and thinking, since fuzzy over pages of output matches
+everything. For those, `/c` searches text literally: everything after it, spaces included,
+with smart case, through every line of every session, output, thinking and subagents
+included. The words before `/c` stay fuzzy and pick which sessions to search:
+`gate /c pin(3)`. It starts when you pause typing, takes about a fifth of a second over
+half a gigabyte, and the transcript shows all output and opens on the first hit. `S-↑` and
+`S-↓` go from hit to hit.
+
+`/h` anywhere in the query keeps only the sessions that worked here: in the current
+directory or under it, or anywhere in its git repository.
 
 ## For your agents
 
@@ -150,7 +159,9 @@ exit 2 on errors, so a script can tell "nothing" from "broken". Brief your agent
 ```markdown
 To find a past Claude Code session, run `ymir --filter '<query>'`. The query is fuzzy over
 each session's project, title, date and branch, and over its prompts, replies and tool calls
-(commands, file paths). It prints `<session-id> <date> <project> <title>`, best match first.
+(commands, file paths). `/c <text>` at the end searches for that text literally, tool output
+included, and `/h` keeps sessions from the current directory or repository. It prints
+`<session-id> <date> <project> <title>`, best match first.
 Read one with `ymir --show <id>`, or `ymir --show <id> --turn N` for one prompt and what
 followed.
 ```
@@ -165,7 +176,7 @@ followed.
 - **Forgiving.** Claude Code's session format isn't a public contract and changes between
   versions. ymir reads only the fields it needs, and skips what it doesn't know rather than
   failing: a new record type, a renamed field, a line still being written.
-- **Small.** About 3,300 lines of Rust and a 1.8 MB binary.
+- **Small.** About 3,800 lines of Rust and a 1.8 MB binary.
 
 Sessions are read from `~/.claude/projects`, or from `$CLAUDE_CONFIG_DIR/projects` when
 that's set.

@@ -61,7 +61,8 @@ bottom row: all as levi does it, and for levi's reasons.
 - **A file watcher crate** (`notify`). levi rejected it too. Polling `stat` on ~130 files every
   2 s costs about a millisecond.
 - **Fuzzy over tool results.** See decision 5.
-- **Showing thinking blocks.** Noise for reading back; in Later as a toggle.
+- **Showing thinking blocks** by default. Noise for reading back. (Superseded in 0.3.0:
+  shown under `C-e`, the toggle that was in Later, so `/c` can find it.)
 
 ## Data format findings
 
@@ -211,7 +212,23 @@ Whole words in the search bar, as in levi (`src/query.rs`):
   subagents. The fuzzy part before it picks which sessions to search. Runs on every core over
   the files, streams hits, starts 300 ms after typing pauses, is cancelled when the text
   changes. The transcript jumps to the first hit; `S-↑`/`S-↓` step through hits.
+  - As built (0.3.0): `/c` searches each session **as `C-e` shows it**, read with no
+    limits, so every hit has a line to jump to, and the transcript shows all output while
+    `/c` is on. For that, `C-e` now also shows thinking (1,208 of my 9,835 thinking blocks
+    have text) and multi-line commands whole; it is the thinking toggle that was in Later.
+    Tool inputs are searched as shown: commands whole, edits as their diffs, created files
+    as their content. Rejected: grepping the raw files (JSON escapes, and the `api-request`
+    lines repeat the whole conversation), and searching what isn't shown (a hit with
+    nowhere to go).
+  - Measured: over 72 sessions (547 MB), 114–137 ms for the search, whatever the text
+    (`the`: 171,853 hits in 63 sessions); `--filter '/c …'` 0.17–0.19 s end to end. No
+    prefilter on the raw bytes was needed.
+  - Hits are in the order of the fuzzy part (newest first without one), so sessions don't
+    move as results stream in. Results for an older text are dropped by generation, as in
+    levi.
 - **`/h`** — here: only sessions that worked inside the current directory (or its repository).
+  Any `cwd` the session recorded counts, not just the first; the repository is found by
+  looking for `.git` upward, without running git.
 - **`/g`** — only sessions with linked commits.
 
 ## Git links
@@ -452,7 +469,8 @@ Each step ends in a release with a CHANGELOG entry; commit messages carry the nu
    words marked; marking costs 2 ms on the largest session (46 ms to open, from 44). Drag
    to copy copies sessions as `--filter` lines, turns as their lines, and transcript text
    with wrapped lines joined back up.
-3. **0.3.0** — `/c` literal search with hit jumps; `/h`.
+3. **0.3.0** — `/c` literal search with hit jumps; `/h`. **Done**, with thinking under
+   `C-e` so `/c` hits in it have somewhere to go.
 4. **0.4.0** — follow live sessions (stat poll, offsets), keeping the selection.
 5. **0.5.0** — git links, measured first against my 656 commit calls; `/g`, sha search.
 6. **0.6.0** — `--pick-context`, `--focus`.
@@ -472,7 +490,7 @@ since the sessions are Claude Code's.
 ## Later (not now)
 
 - Rewound branches (Esc Esc) shown dimmed beside the path that was kept.
-- Thinking blocks, as a toggle.
+- ~~Thinking blocks, as a toggle.~~ Done in 0.3.0, under `C-e`.
 - Syntax colors in diffs (levi's `syntax.rs`, with `syntect`).
 - Open the edited file at the edited line with `C-o`, as levi does.
 - Jump from a linked commit into levi (`levi` at that sha), and from levi to ymir.
